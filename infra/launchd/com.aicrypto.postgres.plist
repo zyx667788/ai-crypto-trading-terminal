@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aicrypto.postgres</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/postgresql@16/bin/postgres</string>
+    <string>-D</string>
+    <string>/opt/homebrew/var/postgresql@16</string>
+    <string>-c</string>
+    <string>listen_addresses=127.0.0.1</string>
+    <string>-c</string>
+    <string>shared_buffers=256MB</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/logs/postgres.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/logs/postgres.err.log</string>
+</dict>
+</plist>

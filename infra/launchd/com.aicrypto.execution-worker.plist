@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aicrypto.execution-worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/services/api/.venv/bin/python</string>
+    <string>-m</string>
+    <string>app.workers.runner</string>
+    <string>--role</string>
+    <string>execution-worker</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__/services/api</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/logs/execution-worker.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/logs/execution-worker.err.log</string>
+</dict>
+</plist>

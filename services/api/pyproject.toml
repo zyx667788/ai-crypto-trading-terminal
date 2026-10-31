@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-crypto-terminal-api"
+version = "1.0.0"
+description = "Personal AI Crypto Trading Terminal Backend (Binance & OKX, Spot & USDT Perpetual)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "sqlalchemy>=2.0.25",
+    "alembic>=1.13.1",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "httpx>=0.27.0",
+    "cryptography>=42.0.0",
+    "websockets>=12.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+# PostgreSQL driver (production / docker-compose). SQLite works without it.
+postgres = [
+    "psycopg[binary]>=3.1.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.5",
+    # Embedded PostgreSQL used by infra/scripts/pg_integration_check.py so the
+    # PostgreSQL path can be verified without Docker or a system install.
+    "pgserver>=0.1.4",
+    "psycopg[binary]>=3.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]

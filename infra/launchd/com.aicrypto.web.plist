@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.aicrypto.web</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/npm</string>
+    <string>run</string>
+    <string>start</string>
+    <string>--</string>
+    <string>-H</string>
+    <string>127.0.0.1</string>
+    <string>-p</string>
+    <string>3000</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_ROOT__/apps/web</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_ROOT__/logs/web.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_ROOT__/logs/web.err.log</string>
+</dict>
+</plist>

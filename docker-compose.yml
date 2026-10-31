@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-crypto-terminal-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-terminal_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-terminal_strong_local_pwd_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_crypto_terminal}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-terminal_user} -d $${POSTGRES_DB:-ai_crypto_terminal}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: ai-crypto-terminal-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--bind", "0.0.0.0"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+    name: ai_crypto_terminal_postgres_data
+  redis_data:
+    name: ai_crypto_terminal_redis_data
