@@ -71,6 +71,11 @@ class TradePlanSchema(BaseModel):
     """
     Strict Pydantic schema for AI Agent TradePlan output (Section 3.6).
     Never executed directly; must pass RiskEngine validation.
+
+    Note on account_id and environment:
+    Kept optional for AI agent/strategy plan generation compatibility, but
+    they are resolved and verified strictly at the execution boundary
+    (resolve_execution_account / ExecutionEngine / Execution Worker).
     """
 
     exchange: Literal["binance", "okx"]
@@ -88,6 +93,8 @@ class TradePlanSchema(BaseModel):
     invalidation_conditions: list[str] = Field(..., min_length=1)
     expires_at: datetime
     strategy_version: str = Field(..., min_length=1)
+    account_id: str | None = None
+    environment: Literal["demo", "testnet", "live"] | None = None
 
     @field_validator("entry_price", "stop_loss", "take_profit", "confidence", mode="before")
     @classmethod

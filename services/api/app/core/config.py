@@ -38,6 +38,26 @@ class Settings(BaseSettings):
     AUTO_TRADING_ENABLED: bool = False
     RECOVERY_CHECKPOINT_TTL_SECONDS: int = 90
 
+    # ------------------------------------------------- runtime hardening (V1.2.1)
+    # Multi-process supervision (API + market worker + execution worker + watchdog)
+    # requires a database with real cross-process locking. SQLite cannot provide it,
+    # so the trading runtime refuses to boot on SQLite unless explicitly downgraded.
+    REQUIRE_DB_DIALECT: Literal["postgresql", "sqlite", "any"] = "postgresql"
+    ENFORCE_DB_DIALECT_IN_PRODUCTION: bool = True
+    DB_POLICY_ALLOW_SQLITE_IN_PRODUCTION: bool = False
+
+    # A worker heartbeat older than this is reported as STALE and marks readiness red.
+    WORKER_HEARTBEAT_TTL_SECONDS: int = 90
+
+    # Local admin API protection. An empty token disables header auth but keeps
+    # Origin/Host enforcement; set it to require an explicit X-Admin-Token header.
+    ADMIN_API_TOKEN: str = ""
+    ENFORCE_ADMIN_ORIGIN: bool = True
+    ADMIN_ALLOWED_ORIGINS: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:8000,http://127.0.0.1:8000"
+    )
+
     # Conservative Default Risk Limits (Section 3.7)
     DEFAULT_MAX_RISK_PER_TRADE_PCT: Decimal = Decimal("0.0025")   # 0.25% equity
     DEFAULT_MAX_DAILY_LOSS_PCT: Decimal = Decimal("0.0100")       # 1.00% equity

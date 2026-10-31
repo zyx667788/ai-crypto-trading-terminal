@@ -58,10 +58,10 @@
 - `GET /api/v1/portfolio/summary` - Dashboard 资产与盈亏总览
 
 ## 5. 自动化、分析、复盘与回测 (Automation, Analytics, Journal & Backtests)
-- `GET /api/v1/automation/status` - 从数据库读取 Automation Control、Recovery Checkpoint 与各进程 Worker Heartbeat
+- `GET /api/v1/automation/status` - 从数据库读取 Automation Control、Recovery Checkpoint 与各进程 Worker Heartbeat；`order_gate` 字段与 Worker 使用**同一个**只读闸门决策
 - `POST /api/v1/automation/start` - 启动自动交易闭环；`AUTO_TRADING_ENABLED=false` 时返回 403，Live 仍需前置检查与二次确认
 - `POST /api/v1/automation/pause` - 持久化暂停自动新开仓，所有 Worker 进程下一轮立即生效
-- `POST /api/v1/automation/run-cycle` - 执行“扫描 -> 策略信号 -> AI TradePlan -> Outbox 入队 -> 复盘”；**不在 API 进程内下单**，订单任务由 Execution Worker 消费
+- `POST /api/v1/automation/run-cycle` - **请求体** `{simulate_ai_invalid_json?, simulate_ai_timeout?, simulate_order_timeout?, confirm?}`；执行“扫描 -> 策略信号 -> AI TradePlan -> Outbox 入队 -> 复盘”；**不在 API 进程内下单**，订单任务由 Execution Worker 消费
 - `GET /api/v1/analytics/summary` - 综合绩效统计（胜率、盈亏比、夏普、最大回撤、费用占比）
 - `GET /api/v1/analytics/equity-curve` - 账户净值曲线序列
 - `GET /api/v1/analytics/strategy-performance` - 各策略与各交易所维度表现对比
@@ -70,7 +70,27 @@
 - `GET /api/v1/backtests` - 回测任务列表
 - `GET /api/v1/backtests/{id}` - 回测详细报告
 
-## 6. WebSocket 实时通道
+## 6. 管理接口防护 (Admin API protection — V1.2.1)
+
+所有 `POST / PUT / PATCH / DELETE /api/v1/*`（健康检查除外）都经过同一层校验：
+
+1. **Host**：只接受 `127.0.0.1`、`localhost`、`::1`（任意端口）；其它 Host 直接 403。
+2. **Sec-Fetch-Site**：为 `cross-site` 时 403 `{"detail":"Cross-site request blocked"}`。
+3. **Origin**：存在时必须精确匹配 `ADMIN_ALLOWED_ORIGINS`（逗号分隔），否则 403 `{"detail":"Origin not allowed"}`。
+4. **X-Admin-Token**：当 `ADMIN_API_TOKEN` 非空时必填，常量时间比对。
+
+既无 `Origin` 也无 `Sec-Fetch-Site` 的调用方（curl / CLI / 测试客户端）被视为非浏览器本地客户端放行。
+前端在 `NEXT_PUBLIC_ADMIN_TOKEN` 存在时会自动附加 `X-Admin-Token`。
+
+受影响的状态变更接口包括：`/automation/{start,pause,run-cycle}`、`/system/recovery/{run,acknowledge}`、`/risk/{kill-switch,resume,reset-daily-locks,flatten}`。
+
+**Recovery 人工确认**：`POST /api/v1/system/recovery/acknowledge`
+```json
+{ "reason": "operator reviewed the incident log", "confirm": true }
+```
+`reason` 至少 10 字符。该接口**不是**绕过：它只解除操作者自己声明的阻断，随后重新执行技术校验（数据库健康、UNKNOWN 订单、未保护持仓、本地/交易所对账），全部通过才置 READY，否则保持 `RECOVERY_MODE` 并在 `new_entries_blocked_due_to` 中给出原因。
+
+## 7. WebSocket 实时通道
 - `/ws/dashboard`, `/ws/market`, `/ws/scanner`, `/ws/agents`, `/ws/orders`, `/ws/positions`, `/ws/risk`, `/ws/system`
 - 统一信封格式：
 ```json

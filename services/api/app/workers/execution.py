@@ -28,8 +28,37 @@ def enqueue_order_task(
     signal_id: str | None,
     client_order_id: str,
     simulate_timeout: bool = False,
+    account_id: str | None = None,
+    exchange: str | None = None,
+    environment: str | None = None,
 ):
     """Producer helper; persistence is committed by the caller with its business state."""
+    eff_exchange = exchange or trade_plan.get("exchange")
+    eff_environment = environment or trade_plan.get("environment")
+    eff_account_id = account_id or trade_plan.get("account_id")
+
+    # If absent, resolve once at enqueue time and persist them
+    if eff_environment is None:
+        try:
+            from app.automation.control import get_control_row
+            ctrl = get_control_row(db)
+            if ctrl and ctrl.environment:
+                eff_environment = ctrl.environment.lower()
+        except Exception:
+            pass
+
+    if eff_account_id is None:
+        acc = execution_engine._resolve_account(
+            db,
+            account_id=None,
+            exchange=eff_exchange,
+            environment=eff_environment,
+        )
+        if acc is not None:
+            eff_account_id = acc.id
+            if eff_environment is None:
+                eff_environment = acc.environment
+
     return outbox_service.enqueue(
         db,
         topic=ORDER_TOPIC,
@@ -41,6 +70,9 @@ def enqueue_order_task(
             "signal_id": signal_id,
             "client_order_id": client_order_id,
             "simulate_timeout": bool(simulate_timeout),
+            "account_id": eff_account_id,
+            "exchange": eff_exchange,
+            "environment": eff_environment,
         },
         max_attempts=5,
     )
@@ -179,10 +211,28 @@ def run_execution_worker_once(
             continue
 
         payload = dict(message.payload_json or {})
+        environment = payload.get("environment")
+        if not environment:
+            err_msg = "Task payload lacks required environment; rejected deterministically without submitting order."
+            logger.error(err_msg, extra={"structured_data": {"outbox_id": message.id}})
+            message.attempts = message.max_attempts  # Terminal error -> transition to DEAD on nack
+            outbox_service.nack(
+                db,
+                message.id,
+                worker_id,
+                error=err_msg,
+                retry_delay=0,
+                auto_commit=True,
+            )
+            results.append({"outbox_id": message.id, "status": "REJECTED_NO_ENVIRONMENT", "error": err_msg})
+            continue
+
         try:
             order = execution_engine.submit_trade_plan(
                 db,
                 payload["trade_plan"],
+                account_id=payload.get("account_id"),
+                environment=environment,
                 decision_id=payload.get("decision_id"),
                 signal_id=payload.get("signal_id"),
                 client_order_id=payload["client_order_id"],

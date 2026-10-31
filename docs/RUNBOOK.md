@@ -1,10 +1,42 @@
 # 运维与故障处理手册 (RUNBOOK.md)
 
-## 1. 日常启动与健康检查
+## 1. 数据库要求与初始化 (Database Policy & Setup)
+
+生产环境与多进程 Worker 架构**强制要求使用 PostgreSQL 14+**。由于多进程架构下（API、Market Worker、Execution Worker、Recovery Watchdog）依赖 PostgreSQL 的行级排他锁与事务 Outbox 消费机制（`FOR UPDATE SKIP LOCKED`），SQLite 无法提供跨进程锁语义，因此 Worker 进程启动时会执行数据库策略检查并拒绝在未授权的 SQLite 环境下启动。
+
+### 1.1 PostgreSQL 初始化步骤 (PostgreSQL Setup)
+```bash
+# 1. 初始化数据库集群（如未安装服务）
+initdb -D /usr/local/var/postgres
+
+# 2. 创建数据库用户与专有数据库
+createuser -s terminal_user
+createdb -O terminal_user ai_crypto_terminal
+
+# 设置密码 (在 psql 或通过 ALTER USER)
+# psql -d ai_crypto_terminal -c "ALTER USER terminal_user WITH ENCRYPTED PASSWORD 'your_password';"
+
+# 3. 配置连接字符串格式 (PostgreSQL 14+ / psycopg v3 driver)
+# postgresql+psycopg://<username>:<password>@<host>:<port>/<dbname>
+export DATABASE_URL="postgresql+psycopg://terminal_user:your_password@127.0.0.1:5432/ai_crypto_terminal"
+
+# 4. 执行 Alembic 数据库迁移同步至最新 Head
+cd services/api
+alembic upgrade head
+```
+
+### 1.2 本地单进程实验与降级 (Local Escape Hatch)
+若在本地单进程调试或自动化单测中需要临时使用 SQLite，可在 Worker 启动时显式传入 `--allow-unsafe-sqlite` 逃生参数：
+```bash
+python -m app.workers.runner --role execution-worker --allow-unsafe-sqlite
+```
+> **警告**：SQLite 仅支持单进程内调试或本地单测，**绝对不安全（NOT SAFE FOR MULTI-PROCESS）**，严禁在生产或多进程并行环境下使用。
+
+## 2. 日常启动与健康检查
 1. 启动服务：`make dev` 或分别启动后端 `uvicorn app.main:app --host 127.0.0.1 --port 8000` 与前端 `npm run dev`。
 2. 检查健康状态：访问 `http://127.0.0.1:8000/health` 确认 API、Database、Cache/EventBus 与各后台 Worker 状态。
 
-## 2. V1.2 Worker 进程与安全闸门
+## 3. V1.2 Worker 进程与安全闸门
 
 分别启动三个进程；它们通过 PostgreSQL 共享状态，不依赖 API 进程内存：
 
@@ -20,7 +52,7 @@ python -m app.workers.runner --role recovery-watchdog
 - 可用 `--once --worker-id <id>` 做单次 bounded 验收；`--lease-seconds` 设置认领租约。
 - `GET /api/v1/automation/status` 可查看所有进程最近心跳与恢复检查点。
 
-## 3. 常见故障应急预案
+## 4. 常见故障应急预案
 
 | 故障场景 | 系统自动保护行为 | 人工处置步骤 |
 | --- | --- | --- |

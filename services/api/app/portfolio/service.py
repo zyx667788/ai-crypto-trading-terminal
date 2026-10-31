@@ -215,12 +215,19 @@ class PortfolioService:
             return []
 
     def _hydrate_simulator(self, db: Session, adapter: Any, account_id: str, positions: list[Position]) -> None:
-        """Mirror the local ledger into a demo/testnet simulator (there is no external book to compare)."""
+        """Mirror the local ledger into a demo/testnet simulator (there is no external book to compare).
+
+        The mirror is authoritative: the simulator's position book is rebuilt from the
+        ledger on every reconciliation instead of being merged into. Merging left stale
+        entries behind after a position closed, which then looked like an orphan
+        exchange position and blocked every later reconciliation.
+        """
         state = getattr(adapter, "_state", None)
         if state is None or not isinstance(state, dict):
             return
 
-        live_positions = state.setdefault("positions", {})
+        live_positions: dict[Any, Any] = {}
+        state["positions"] = live_positions
         for pos in positions:
             qty = to_decimal(pos.qty, ZERO)
             if qty <= ZERO:
@@ -313,6 +320,19 @@ class PortfolioService:
             elif remote_qty != to_decimal(lp.qty, ZERO):
                 mismatches.append(f"Position qty mismatch {lp.symbol} {lp.position_side}: local={lp.qty} exchange={remote_qty}")
 
+        # Reverse direction: an exposure that exists on the exchange but has no local record
+        # is strictly worse than a missing remote position - the system would size new trades
+        # on top of risk it cannot see. Reconciliation must be bidirectional.
+        local_keys = {(lp.symbol, (lp.position_side or "LONG").upper()) for lp in local_positions}
+        for (symbol, side), remote_qty in remote_by_key.items():
+            if (symbol, side) in local_keys:
+                continue
+            if remote_qty == ZERO:
+                continue
+            mismatches.append(
+                f"Orphan exchange position {symbol} {side} qty={remote_qty} has no local record."
+            )
+
         # ---- 2) Orders stuck in UNKNOWN (must be queried by client_order_id)
         unknown_orders = db.execute(
             select(Order).where(Order.account_id == account_id, Order.status == "UNKNOWN")
@@ -321,6 +341,12 @@ class PortfolioService:
             mismatches.append(f"Order {o.client_order_id} is UNKNOWN; query the exchange before any new entry.")
 
         # ---- 3) Protective orders on open positions
+        #
+        # `tp_sl_confirmed` is a LOCAL flag. While the shipped adapters are simulators there
+        # is no exchange-native protective-order query to call, so this check cannot prove
+        # the order still exists remotely. The result records that limitation explicitly
+        # instead of presenting a local boolean as exchange evidence.
+        protective_order_evidence = "LOCAL_ONLY"
         for lp in local_positions:
             if not bool(lp.tp_sl_confirmed):
                 mismatches.append(f"Position {lp.symbol} has no confirmed exchange-native stop-loss/take-profit.")
@@ -360,6 +386,8 @@ class PortfolioService:
             "mismatches": mismatches,
             "sync_status": account.sync_status,
             "trading_locked": account.trading_locked,
+            "position_evidence": "SIMULATED" if is_simulated else "REMOTE",
+            "protective_order_evidence": protective_order_evidence,
             "reconciled_at": utc_iso(),
         }
         event_bus.publish_sync("orders", "account.reconciled", result, source=account.exchange)

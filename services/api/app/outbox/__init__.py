@@ -9,6 +9,7 @@ from app.outbox.service import (
     nack,
     outbox_service,
     reclaim_expired,
+    renew,
 )
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "enqueue",
     "claim",
     "ack",
+    "renew",
     "nack",
     "reclaim_expired",
 ]

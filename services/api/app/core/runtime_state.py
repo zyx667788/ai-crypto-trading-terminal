@@ -8,10 +8,36 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.precision import utc_iso, utc_now
 from app.models.runtime import RecoveryCheckpoint, WorkerHeartbeat
 
 RECOVERY_KEY = "global"
+
+# Roles that must have at least one ONLINE worker for the terminal to be ready.
+# The watchdog is deliberately NOT required: it is allowed to run as a
+# cron/launchd one-shot that only fires occasionally, so its heartbeat age is
+# not evidence of a broken terminal.
+REQUIRED_WORKER_ROLES = ["market-worker", "execution-worker"]
+
+
+def _utc_aware(value: Any) -> Any | None:
+    """Treat stored naive datetimes as UTC (UTCDateTime stores UTC-naive)."""
+    if value is None:
+        return None
+    from datetime import timezone
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _heartbeat_age_seconds(row: WorkerHeartbeat) -> float | None:
+    stamp = row.updated_at or row.last_run_at
+    if stamp is None:
+        return None
+    stamp = _utc_aware(stamp)
+    return max(0.0, (utc_now() - stamp).total_seconds())
 
 
 class RuntimeStateRepository:
@@ -97,6 +123,18 @@ class RuntimeStateRepository:
 
     @staticmethod
     def serialize_worker(row: WorkerHeartbeat) -> dict[str, Any]:
+        age = _heartbeat_age_seconds(row)
+        ttl = int(settings.WORKER_HEARTBEAT_TTL_SECONDS)
+        failures = int(row.consecutive_failures or 0)
+        stale = age is not None and age > ttl
+        if age is None:
+            liveness = "OFFLINE"
+        elif stale:
+            liveness = "STALE"
+        elif failures >= 3:
+            liveness = "FAILING"
+        else:
+            liveness = "ONLINE"
         return {
             "worker_id": row.worker_id,
             "role": row.role,
@@ -110,12 +148,57 @@ class RuntimeStateRepository:
             "last_error": row.last_error,
             "details": dict(row.details_json or {}),
             "updated_at": utc_iso(row.updated_at) if row.updated_at else None,
-            "healthy": int(row.consecutive_failures or 0) < 3,
+            "age_seconds": age,
+            "heartbeat_ttl_seconds": ttl,
+            "stale": stale,
+            "liveness": liveness,
+            # "healthy" now means heartbeat liveness (ONLINE), not merely
+            # "consecutive_failures < 3", so a SIGKILLed worker no longer
+            # reports healthy forever.
+            "healthy": liveness == "ONLINE",
         }
 
-    def list_workers(self, db: Session) -> list[dict[str, Any]]:
-        rows = db.scalars(select(WorkerHeartbeat).order_by(WorkerHeartbeat.role, WorkerHeartbeat.worker_id)).all()
+    def list_workers(self, db: Session, *, role: str | None = None) -> list[dict[str, Any]]:
+        query = select(WorkerHeartbeat).order_by(WorkerHeartbeat.role, WorkerHeartbeat.worker_id)
+        if role is not None:
+            query = query.where(WorkerHeartbeat.role == role)
+        rows = db.scalars(query).all()
         return [self.serialize_worker(row) for row in rows]
+
+    @staticmethod
+    def required_roles() -> list[str]:
+        return list(REQUIRED_WORKER_ROLES)
+
+    def readiness_summary(self, db: Session) -> dict[str, Any]:
+        """Summarize whether every required worker role has an ONLINE worker.
+
+        The watchdog is not in the required roles because it is allowed to run
+        as a cron/launchd one-shot (its heartbeat may legitimately be old).
+        """
+        workers = self.list_workers(db)
+        by_role: dict[str, list[dict[str, Any]]] = {}
+        for w in workers:
+            by_role.setdefault(w["role"], []).append(w)
+        missing_roles = [r for r in REQUIRED_WORKER_ROLES if r not in by_role]
+        stale_roles = [
+            r
+            for r in REQUIRED_WORKER_ROLES
+            if r in by_role and not any(w["liveness"] == "ONLINE" for w in by_role[r])
+        ]
+        ready = not missing_roles and not stale_roles
+        if ready:
+            detail = "all required worker roles ONLINE"
+        elif missing_roles:
+            detail = "missing worker roles: " + ", ".join(missing_roles)
+        else:
+            detail = "stale worker roles: " + ", ".join(stale_roles)
+        return {
+            "ready": ready,
+            "workers": workers,
+            "missing_roles": missing_roles,
+            "stale_roles": stale_roles,
+            "detail": detail,
+        }
 
 
 runtime_state = RuntimeStateRepository()

@@ -200,6 +200,91 @@ def is_manual_kill_switch_blocked(
     return blocked
 
 
+def adapters_are_simulated() -> bool:
+    """
+    True while every shipped exchange adapter is the deterministic in-memory simulator.
+
+    This is deliberately computed from the adapter classes rather than from a config
+    flag: a flag can be forgotten, an inheritance chain cannot. As soon as a real
+    REST/WebSocket adapter replaces the simulated base class this starts returning
+    False and the readiness tier is allowed to climb above DEMO_READY.
+    """
+    try:
+        from app.exchanges.base import BaseSimulatedExchangeAdapter
+        from app.exchanges.binance.adapter import BinanceAdapter
+        from app.exchanges.okx.adapter import OKXAdapter
+    except Exception:  # pragma: no cover - import failure must not claim real connectivity
+        return True
+    try:
+        return issubclass(BinanceAdapter, BaseSimulatedExchangeAdapter) and issubclass(
+            OKXAdapter, BaseSimulatedExchangeAdapter
+        )
+    except TypeError:  # pragma: no cover
+        return True
+
+
+READINESS_TIERS = ("SIMULATED_READY", "DEMO_READY", "TESTNET_READY", "LIVE_READY")
+
+
+def compute_readiness_tier(db: Any) -> dict[str, Any]:
+    """
+    Report what kind of readiness the system can actually prove.
+
+    The tier is the *minimum* of what the adapters support and what the configured
+    accounts need. A simulated adapter can never yield LIVE_READY, and a live account
+    held by a simulated adapter is reported as SIMULATED_READY with an explicit
+    downgrade reason instead of being silently trusted.
+    """
+    from app.core.config import settings
+    from app.models.entities import TradingAccount
+    from sqlalchemy import select
+
+    simulated = adapters_are_simulated()
+    environments: list[str] = []
+    try:
+        environments = sorted(
+            {
+                (acc.environment or "demo").strip().lower()
+                for acc in db.scalars(select(TradingAccount)).all()
+            }
+        )
+    except Exception:
+        environments = []
+
+    downgrades: list[str] = []
+    if not environments:
+        tier = "SIMULATED_READY"
+        downgrades.append("No trading account is configured.")
+    elif "live" in environments:
+        tier = "LIVE_READY"
+    elif "testnet" in environments:
+        tier = "TESTNET_READY"
+    else:
+        tier = "DEMO_READY"
+
+    if simulated and tier != "SIMULATED_READY":
+        downgrades.append(
+            "Exchange adapters are deterministic in-memory simulators; "
+            f"readiness cannot exceed SIMULATED_READY (requested tier: {tier})."
+        )
+        tier = "SIMULATED_READY"
+    if not getattr(settings, "LIVE_TRADING_ENABLED", False) and tier == "LIVE_READY":
+        downgrades.append("LIVE_TRADING_ENABLED=false.")
+        tier = "SIMULATED_READY"
+
+    return {
+        "tier": tier,
+        "live_ready": tier == "LIVE_READY",
+        "adapters_simulated": simulated,
+        "environments": environments,
+        "downgrades": downgrades,
+        "note": (
+            "SIMULATED_READY means balances, orders and fills live in process memory. "
+            "It is not evidence of exchange connectivity."
+        ),
+    }
+
+
 class RecoveryManager:
     """Tracks and executes the recovery sequence. New entries stay blocked until READY."""
 
@@ -337,6 +422,7 @@ class RecoveryManager:
                     status["ready"] = False
                     if status["state"] == RecoveryState.READY.value:
                         status["state"] = RecoveryState.RECOVERY_MODE.value
+                status["readiness"] = compute_readiness_tier(db)
                 return status
 
         if db is not None:
@@ -358,6 +444,7 @@ class RecoveryManager:
             "started_at": started_at_str,
             "completed_at": completed_at_str,
             "counts": counts,
+            "readiness": compute_readiness_tier(db) if db is not None else None,
             "policy": {
                 "auto_flatten_on_recovery": False,
                 "auto_resume_live_entries": False,
@@ -513,11 +600,29 @@ class RecoveryManager:
             return self.get_status()
 
         # 4) Exchange connectivity
+        #
+        # Never assume an exchange is reachable just because no connection record exists.
+        # The previous implementation defaulted to ["binance", "okx"] here, which let a
+        # completely unconfigured installation report a successful connectivity step.
         connections = db.execute(select(ExchangeConnection)).scalars().all()
         reachable = [c.exchange for c in connections if c.status in ("CONNECTED", "ACTIVE", "VERIFIED")]
-        if not reachable:
-            reachable = ["binance", "okx"]  # simulated/demo adapters are always locally reachable
-        self._transition(RecoveryState.CONNECT_BINANCE_AND_OKX, True, f"reachable exchanges: {', '.join(sorted(set(reachable)))}")
+        if reachable:
+            self._transition(
+                RecoveryState.CONNECT_BINANCE_AND_OKX,
+                True,
+                f"reachable exchanges: {', '.join(sorted(set(reachable)))}",
+            )
+        else:
+            self._transition(
+                RecoveryState.CONNECT_BINANCE_AND_OKX,
+                False,
+                "No verified exchange connection is configured; nothing can be queried remotely.",
+            )
+            if account_count:
+                self._add_transient_blocker(
+                    "No verified exchange connection is configured while trading accounts exist; "
+                    "remote state cannot be proven, so new entries stay blocked."
+                )
 
         # 5) Fetch remote state (balances / positions / open orders / fills)
         self._transition(
@@ -641,50 +746,173 @@ class RecoveryManager:
         except Exception:
             pass
 
+    def _technical_recheck(self, db: Any) -> tuple[bool, list[str]]:
+        """
+        Re-run the technical half of recovery without touching operator-owned blockers.
+
+        Used by the acknowledgement endpoint so that an operator acknowledgement can
+        never substitute for a real reconciliation: it clears the operator's own
+        blocker, then this method decides whether the system may actually trade.
+        """
+        from sqlalchemy import select
+
+        from app.core.watchdog import watchdog_service
+        from app.models.entities import Order, Position
+
+        reasons: list[str] = []
+
+        try:
+            db_check = watchdog_service.check_database()
+            if (db_check or {}).get("status") != "healthy":
+                reasons.append(f"Database is not healthy ({(db_check or {}).get('status')}).")
+        except Exception as exc:
+            reasons.append(f"Database health check failed: {exc}")
+
+        try:
+            unknown = db.execute(select(Order).where(Order.status == "UNKNOWN")).scalars().all()
+            self.last_unknown_order_count = len(unknown)
+            if unknown:
+                reasons.append(
+                    f"{len(unknown)} order(s) remain UNKNOWN; each must be queried by client_order_id before any new entry."
+                )
+        except Exception as exc:
+            reasons.append(f"UNKNOWN order check failed: {exc}")
+
+        try:
+            positions = db.execute(select(Position).where(Position.status == "OPEN")).scalars().all()
+            unprotected = [p for p in positions if not bool(p.tp_sl_confirmed)]
+            self.last_unprotected_position_count = len(unprotected)
+            if unprotected:
+                reasons.append(
+                    f"{len(unprotected)} open position(s) lack a confirmed exchange-native protective order."
+                )
+        except Exception as exc:
+            reasons.append(f"Protective-order check failed: {exc}")
+
+        try:
+            if self._reconcile_hook is not None:
+                result = self._reconcile_hook(db) or {}
+            else:
+                from app.portfolio.service import portfolio_service
+
+                result = portfolio_service.reconcile_all_accounts(db) or {}
+            mismatch_count = int(result.get("mismatch_count", 0) or 0)
+            self.last_mismatch_count = mismatch_count
+            if mismatch_count:
+                reasons.append(f"Local and exchange state still disagree ({mismatch_count} mismatch(es)).")
+        except Exception as exc:
+            reasons.append(f"Reconciliation re-run failed: {exc}")
+
+        return (not reasons), reasons
+
     def acknowledge_and_ready(self, reason: str, db: Any = None) -> dict[str, Any]:
-        """Operator-explicit resume of new entries after a blocked recovery (V1.1 default policy)."""
-        db_blocked = False
-        db_reasons: list[str] = []
-        if db is not None:
-            db_blocked, db_reasons = check_manual_kill_switch_state(db)
-        else:
+        """
+        Operator acknowledgement of a blocked recovery — a re-check, not a bypass.
+
+        An acknowledgement may only lift blockers the operator themselves declared. It
+        then re-runs the technical checks (database health, local vs exchange
+        reconciliation, UNKNOWN orders, exchange-native protective orders) and reaches
+        READY only when every one of them passes in this very call. A stale exchange
+        view, an UNKNOWN order or an unprotected position keeps new entries disabled no
+        matter how many times an operator acknowledges.
+        """
+        if not reason or len(reason.strip()) < 10:
+            raise ValueError("An acknowledgement reason of at least 10 characters is required.")
+
+        owned_session = False
+        if db is None:
             try:
                 from app.db.session import SessionLocal
 
-                with SessionLocal() as session:
-                    db_blocked, db_reasons = check_manual_kill_switch_state(session)
-            except Exception as exc:
-                db_blocked, db_reasons = True, [f"Database acknowledgement check failed; failing closed: {exc}"]
+                db = SessionLocal()
+                owned_session = True
+            except Exception as exc:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    f"Operator acknowledgement requires a database session: {exc}"
+                ) from exc
 
-        with self._lock:
-            if db_blocked:
-                self.state = RecoveryState.RECOVERY_MODE
-                for r in db_reasons:
-                    if r not in self.blockers:
-                        self.blockers.append(r)
-                self.steps.append(
-                    RecoveryStep(
-                        state="RECOVERY_MODE",
-                        ok=False,
-                        detail=f"Operator acknowledge rejected: active manual block in database ({'; '.join(db_reasons)})",
-                    )
-                )
-                logger.warning("recovery_acknowledge_rejected_manual_block", extra={"structured_data": {"reasons": db_reasons}})
-                self._persist(db)
-                return self.get_status()
-
-            # No persistent manual blocks in DB
-            self.blockers.clear()
-            self._manual_blockers.clear()
-            self.state = RecoveryState.READY
-            self.completed_at = utc_now()
-            self.steps.append(RecoveryStep(state="READY", ok=True, detail=f"Operator acknowledged recovery: {reason}"))
         try:
-            event_bus.publish_sync("system", "recovery.operator_acknowledged", {"reason": reason}, source="recovery")
-        except Exception:
-            pass
-        self._persist(db)
-        return self.get_status()
+            db_blocked, db_reasons = check_manual_kill_switch_state(db)
+            if db_blocked:
+                with self._lock:
+                    self.state = RecoveryState.RECOVERY_MODE
+                    for r in db_reasons:
+                        if r not in self.blockers:
+                            self.blockers.append(r)
+                    self.steps.append(
+                        RecoveryStep(
+                            state="RECOVERY_MODE",
+                            ok=False,
+                            detail=f"Operator acknowledge rejected: active manual block in database ({'; '.join(db_reasons)})",
+                        )
+                    )
+                logger.warning(
+                    "recovery_acknowledge_rejected_manual_block",
+                    extra={"structured_data": {"reasons": db_reasons}},
+                )
+                self._persist(db)
+                return self.get_status(db)
+
+            technical_ok, technical_reasons = self._technical_recheck(db)
+
+            with self._lock:
+                # Clear only operator-declared blockers; DB-derived ones were handled above.
+                cleared = list(self._manual_blockers)
+                for blocker in cleared:
+                    self.blockers = [b for b in self.blockers if b != blocker]
+                self._manual_blockers.clear()
+
+                if technical_ok:
+                    self.blockers.clear()
+                    self.state = RecoveryState.READY
+                    self.completed_at = utc_now()
+                    self.steps.append(
+                        RecoveryStep(
+                            state="READY",
+                            ok=True,
+                            detail=f"Operator acknowledged recovery after a full technical re-check: {reason}",
+                        )
+                    )
+                else:
+                    self.state = RecoveryState.RECOVERY_MODE
+                    self.completed_at = utc_now()
+                    for r in technical_reasons:
+                        if r not in self.blockers:
+                            self.blockers.append(r)
+                    self.blockers = list(dict.fromkeys(self.blockers))
+                    self.steps.append(
+                        RecoveryStep(
+                            state="RECOVERY_MODE",
+                            ok=False,
+                            detail=(
+                                "Operator acknowledgement recorded but technical re-check failed: "
+                                + "; ".join(technical_reasons[:5])
+                            ),
+                        )
+                    )
+
+            try:
+                event_bus.publish_sync(
+                    "system",
+                    "recovery.operator_acknowledged",
+                    {
+                        "reason": reason,
+                        "technical_ok": technical_ok,
+                        "blocking_reasons": technical_reasons,
+                        "cleared_operator_blockers": cleared,
+                    },
+                    source="recovery",
+                )
+            except Exception:
+                pass
+            self._persist(db)
+            return self.get_status(db)
+        finally:
+            if owned_session:
+                try:
+                    db.close()
+                except Exception:
+                    pass
 
     def record_system_event(self, db: Any, event_type: str, severity: str, payload: dict[str, Any]) -> None:
         from app.models.entities import SystemEvent

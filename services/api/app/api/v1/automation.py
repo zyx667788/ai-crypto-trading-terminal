@@ -9,11 +9,20 @@ from app.core.config import settings
 from app.core.events import event_bus
 from app.core.recovery import recovery_manager
 from app.db.session import get_db
+from app.core.admin_auth import require_admin
+from pydantic import BaseModel, Field
 from app.journal.service import journal_service
 from app.schemas.domain import AutomationControlRequest, BacktestCreateRequest
 from app.workers.scheduler import worker_manager
 
 router = APIRouter(tags=["automation-analytics"])
+
+class AutomationRunCycleRequest(BaseModel):
+    simulate_ai_invalid_json: bool = False
+    simulate_ai_timeout: bool = False
+    simulate_order_timeout: bool = False
+    confirm: bool = True
+
 
 LIVE_CONFIRMATION_PHRASE = "I UNDERSTAND LIVE TRADING RISK"
 
@@ -28,7 +37,7 @@ def automation_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     }
 
 
-@router.post("/automation/start")
+@router.post("/automation/start", dependencies=[Depends(require_admin)])
 def start_automation(payload: AutomationControlRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     if not settings.AUTO_TRADING_ENABLED:
         raise HTTPException(status_code=403, detail="Automation is disabled (AUTO_TRADING_ENABLED=false).")
@@ -54,25 +63,23 @@ def start_automation(payload: AutomationControlRequest, db: Session = Depends(ge
     return result
 
 
-@router.post("/automation/pause")
+@router.post("/automation/pause", dependencies=[Depends(require_admin)])
 def pause_automation(db: Session = Depends(get_db)) -> dict[str, Any]:
     result = worker_manager.pause_automation(db)
     event_bus.publish_sync("agents", "automation.paused", result, source="automation")
     return result
 
 
-@router.post("/automation/run-cycle")
+@router.post("/automation/run-cycle", dependencies=[Depends(require_admin)])
 def run_automation_cycle(
-    simulate_ai_invalid_json: bool = False,
-    simulate_ai_timeout: bool = False,
-    simulate_order_timeout: bool = False,
+    payload: AutomationRunCycleRequest = AutomationRunCycleRequest(),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     return worker_manager.run_automation_cycle(
         db,
-        simulate_ai_invalid_json=simulate_ai_invalid_json,
-        simulate_ai_timeout=simulate_ai_timeout,
-        simulate_order_timeout=simulate_order_timeout,
+        simulate_ai_invalid_json=payload.simulate_ai_invalid_json,
+        simulate_ai_timeout=payload.simulate_ai_timeout,
+        simulate_order_timeout=payload.simulate_order_timeout,
     )
 
 

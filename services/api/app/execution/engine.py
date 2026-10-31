@@ -44,6 +44,18 @@ from app.schemas.domain import OrderSubmitRequest, TradePlanSchema
 logger = get_logger("terminal.execution")
 
 
+class ExecutionError(Exception):
+    """Base exception for execution-layer errors."""
+
+
+class AccountEnvironmentMismatch(ExecutionError, ValueError):
+    """Raised when an account's environment does not match the requested environment."""
+
+
+class AmbiguousAccountError(ExecutionError, ValueError):
+    """Raised when multiple active accounts match the requested exchange/environment query."""
+
+
 VALID_ORDER_TRANSITIONS: dict[str, set[str]] = {
     "CREATED": {"VALIDATED", "REJECTED", "CANCELED"},
     "VALIDATED": {"SUBMITTED", "REJECTED", "CANCELED"},
@@ -162,7 +174,42 @@ class ExecutionEngine:
         db: Session,
         account_id: str | None = None,
         exchange: str | None = None,
+        environment: str | None = None,
     ) -> TradingAccount | None:
+        if environment is not None and str(environment).strip():
+            env_val = str(environment).strip().lower()
+            if account_id:
+                acc = db.scalar(select(TradingAccount).where(TradingAccount.id == account_id))
+                if acc is None:
+                    return None
+                if acc.environment.lower() != env_val:
+                    raise AccountEnvironmentMismatch(
+                        f"Account {account_id} environment ({acc.environment}) does not match requested environment ({env_val})"
+                    )
+                if exchange and acc.exchange.lower() != exchange.lower():
+                    raise AccountEnvironmentMismatch(
+                        f"Account {account_id} exchange ({acc.exchange}) does not match requested exchange ({exchange.lower()})"
+                    )
+                return acc
+
+            stmt = select(TradingAccount).where(
+                TradingAccount.environment == env_val,
+                TradingAccount.is_active == True,
+            )
+            if exchange:
+                stmt = stmt.where(TradingAccount.exchange == exchange.lower())
+            stmt = stmt.order_by(TradingAccount.created_at.asc())
+            matches = list(db.scalars(stmt).all())
+            if len(matches) > 1:
+                acct_summaries = [f"(id={a.id}, exchange={a.exchange}, env={a.environment})" for a in matches]
+                raise AmbiguousAccountError(
+                    f"Ambiguous account resolution: found {len(matches)} active accounts matching "
+                    f"exchange={exchange}, environment={env_val}: {', '.join(acct_summaries)}"
+                )
+            if len(matches) == 1:
+                return matches[0]
+            return None
+
         if account_id:
             acc = db.scalar(select(TradingAccount).where(TradingAccount.id == account_id))
             if acc is not None:
@@ -178,6 +225,59 @@ class ExecutionEngine:
         return db.scalar(
             select(TradingAccount).order_by(TradingAccount.is_active.desc(), TradingAccount.created_at.asc())
         )
+
+    def resolve_execution_account(
+        self,
+        db: Session,
+        *,
+        account_id: str | None = None,
+        exchange: str | None = None,
+        environment: str | None = None,
+    ) -> TradingAccount:
+        if not environment or not str(environment).strip():
+            raise ValueError("resolve_execution_account requires a non-empty environment")
+
+        env_val = str(environment).strip().lower()
+
+        if account_id:
+            acc = db.scalar(select(TradingAccount).where(TradingAccount.id == account_id))
+            if acc is None:
+                raise AccountEnvironmentMismatch(f"Account {account_id} not found")
+            if acc.environment.lower() != env_val:
+                raise AccountEnvironmentMismatch(
+                    f"Account {account_id} environment ({acc.environment}) does not match requested environment ({env_val})"
+                )
+            if exchange and acc.exchange.lower() != exchange.lower():
+                raise AccountEnvironmentMismatch(
+                    f"Account {account_id} exchange ({acc.exchange}) does not match requested exchange ({exchange.lower()})"
+                )
+            return acc
+
+        stmt = select(TradingAccount).where(
+            TradingAccount.environment == env_val,
+            TradingAccount.is_active == True,
+        )
+        if exchange:
+            stmt = stmt.where(TradingAccount.exchange == exchange.lower())
+        stmt = stmt.order_by(TradingAccount.created_at.asc())
+        matches = list(db.scalars(stmt).all())
+
+        if len(matches) == 0:
+            all_accounts = list(db.scalars(select(TradingAccount)).all())
+            found_summary = [f"(id={a.id}, exchange={a.exchange}, env={a.environment}, active={a.is_active})" for a in all_accounts]
+            raise AccountEnvironmentMismatch(
+                f"No active account found for exchange={exchange}, environment={env_val}. "
+                f"Available accounts: {', '.join(found_summary) if found_summary else 'none'}"
+            )
+
+        if len(matches) > 1:
+            acct_summaries = [f"(id={a.id}, exchange={a.exchange}, env={a.environment})" for a in matches]
+            raise AmbiguousAccountError(
+                f"Ambiguous account resolution: found {len(matches)} active accounts matching "
+                f"exchange={exchange}, environment={env_val}: {', '.join(acct_summaries)}"
+            )
+
+        return matches[0]
 
     def _resolve_instrument(
         self,
@@ -776,6 +876,7 @@ class ExecutionEngine:
         trade_plan: TradePlanSchema | dict[str, Any],
         *,
         account_id: str | None = None,
+        environment: str | None = None,
         signal_id: str | None = None,
         decision_id: str | None = None,
         client_order_id: str | None = None,
@@ -792,9 +893,26 @@ class ExecutionEngine:
             else TradePlanSchema.model_validate(trade_plan)
         )
 
-        account = self._resolve_account(db, account_id=account_id, exchange=plan.exchange)
-        resolved_account_id = account.id if account is not None else (account_id or "default")
-        env_name = account.environment if account is not None else "demo"
+        eff_account_id = account_id or plan.account_id
+        eff_environment = environment or plan.environment
+
+        if eff_environment is not None and str(eff_environment).strip():
+            account = self.resolve_execution_account(
+                db,
+                account_id=eff_account_id,
+                exchange=plan.exchange,
+                environment=eff_environment,
+            )
+            resolved_account_id = account.id
+            env_name = eff_environment.lower()
+        else:
+            logger.warning(
+                "submit_trade_plan called without explicit environment; "
+                "falling back to legacy account environment resolution"
+            )
+            account = self._resolve_account(db, account_id=eff_account_id, exchange=plan.exchange)
+            resolved_account_id = account.id if account is not None else (eff_account_id or "default")
+            env_name = account.environment if account is not None else "demo"
 
         # 1. Idempotency check by (account_id, client_order_id) BEFORE evaluating or placing duplicate order
         if client_order_id:
@@ -1123,6 +1241,7 @@ class ExecutionEngine:
                 db,
                 request.trade_plan,
                 account_id=request.account_id,
+                environment=kwargs.get("environment"),
                 signal_id=request.signal_id,
                 decision_id=request.decision_id,
                 client_order_id=request.client_order_id,
@@ -1131,7 +1250,7 @@ class ExecutionEngine:
             )
         if isinstance(request, dict) and "trade_plan" in request:
             parsed = OrderSubmitRequest.model_validate(request)
-            return self.submit_order(db, parsed)
+            return self.submit_order(db, parsed, **kwargs)
         return self.submit_trade_plan(db, request, **kwargs)
 
     def reconcile_unknown_order(

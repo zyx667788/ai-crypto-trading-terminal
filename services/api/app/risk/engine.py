@@ -157,6 +157,26 @@ class RiskEngine:
     def reset_api_failures(self, account_id: str) -> None:
         self.consecutive_api_failures[account_id] = 0
 
+    def assert_account_matches_automation_environment(
+        self,
+        db: Session,
+        account: TradingAccount,
+        automation_environment: str | None,
+    ) -> None:
+        """
+        Pre-trade assertion: Fail closed if the account environment does not match
+        the automation environment.
+        """
+        if not automation_environment:
+            return
+        acc_env = (account.environment or "demo").strip().lower()
+        auto_env = str(automation_environment).strip().lower()
+        if acc_env != auto_env:
+            raise ValueError(
+                f"Account environment mismatch: account {account.id} is in {acc_env!r} "
+                f"but automation environment is {auto_env!r}"
+            )
+
     def _resolve_account(
         self,
         db: Session,
@@ -797,6 +817,26 @@ class RiskEngine:
 
             env_name = (account.environment or (connection.environment if connection else "demo")).lower()
             live_locked = env_name == "live" and not bool(settings.LIVE_TRADING_ENABLED)
+
+            # Assert account.environment matches automation environment if automation is configured
+            automation_env_mismatch = False
+            try:
+                from app.automation.control import get_control_row
+                ctrl = get_control_row(db)
+                if ctrl and ctrl.environment:
+                    self.assert_account_matches_automation_environment(db, account, ctrl.environment)
+            except Exception as auto_exc:
+                automation_env_mismatch = True
+                return self._record_rejection(
+                    db,
+                    account_id=account.id,
+                    rule_code="ACCOUNT_CAPABILITY_OR_LIVE_LOCK",
+                    reason=f"Rule 5 violation: Automation environment assertion failed: {auto_exc}",
+                    severity="CRITICAL",
+                    signal_id=signal_id,
+                    decision_id=decision_id,
+                    plan_summary=plan_summary,
+                )
 
             if connection is None or conn_status != "CONNECTED" or has_withdraw or not market_supported or live_locked:
                 return self._record_rejection(

@@ -10,8 +10,16 @@ from app.core.events import CHANNELS, event_bus
 from app.core.recovery import recovery_manager
 from app.core.watchdog import watchdog_service
 from app.db.session import get_db
+from app.core.admin_auth import require_admin
+from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["system"])
+
+class RecoveryAcknowledgeRequest(BaseModel):
+    reason: str = Field(..., min_length=10, description="Audit reason for acknowledging recovery")
+    confirm: bool = True
+
+
 
 
 @router.get("/system/status")
@@ -24,14 +32,14 @@ def get_recovery(db: Session = Depends(get_db)) -> dict[str, Any]:
     return recovery_manager.get_status(db)
 
 
-@router.post("/system/recovery/run")
+@router.post("/system/recovery/run", dependencies=[Depends(require_admin)])
 def run_recovery(force: bool = False, db: Session = Depends(get_db)) -> dict[str, Any]:
     return recovery_manager.run_recovery(db, force=force)
 
 
-@router.post("/system/recovery/acknowledge")
-def acknowledge_recovery(reason: str = "Operator reviewed reconciliation and protective orders", db: Session = Depends(get_db)) -> dict[str, Any]:
-    return recovery_manager.acknowledge_and_ready(reason, db=db)
+@router.post("/system/recovery/acknowledge", dependencies=[Depends(require_admin)])
+def acknowledge_recovery(payload: RecoveryAcknowledgeRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return recovery_manager.acknowledge_and_ready(payload.reason, db=db)
 
 
 @router.get("/system/events")

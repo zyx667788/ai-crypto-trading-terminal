@@ -80,35 +80,16 @@ class BackgroundWorkerManager:
         return result
 
     def new_order_gate(self, db: Session) -> tuple[bool, str]:
-        """One durable gate shared by every producer and the Execution Worker."""
-        from app.automation import control as automation_control
-        from app.core.recovery import recovery_manager
-        from app.models.entities import KillSwitchState
+        """One durable gate shared by every producer and the Execution Worker.
 
-        if not settings.AUTO_TRADING_ENABLED:
-            return False, "AUTO_TRADING_DISABLED"
-        try:
-            status = automation_control.get_status(db)
-            global_kill = db.scalar(
-                select(KillSwitchState).where(
-                    KillSwitchState.scope == "global",
-                    KillSwitchState.enabled.is_(True),
-                )
-            )
-            if global_kill is not None:
-                return False, f"KILL_SWITCH_ACTIVE: {global_kill.reason}"
-            if status.get("manual_block_reason"):
-                return False, f"MANUAL_BLOCK: {status['manual_block_reason']}"
-            if not status.get("running"):
-                return False, "AUTOMATION_NOT_RUNNING"
-            if status.get("paused"):
-                return False, f"AUTOMATION_PAUSED: {status.get('pause_reason') or 'operator pause'}"
-            if not recovery_manager.is_ready(db):
-                return False, "RECOVERY_NOT_READY"
-            return True, "READY"
-        except Exception as exc:
-            logger.error("durable order gate failed closed", extra={"structured_data": {"error": str(exc)}})
-            return False, f"ORDER_GATE_FAIL_CLOSED: {exc}"
+        The decision itself lives in `app.automation.gate` so that the dashboard, the
+        scheduler and the Execution Worker cannot drift apart. This method is a thin
+        adapter kept for existing callers.
+        """
+        from app.automation.gate import evaluate_order_gate
+
+        decision = evaluate_order_gate(db)
+        return decision.allowed, decision.reason
 
     def get_automation_status(self, db: Session | None = None) -> dict[str, Any]:
         persisted: dict[str, Any] = {}
@@ -132,12 +113,23 @@ class BackgroundWorkerManager:
             if latest is not None:
                 last_at = utc_iso(latest.created_at)
                 last_summary = {"event_type": latest.event_type, **dict(latest.payload or {})}
+        # The reported order-entry status must come from the same gate the workers use,
+        # otherwise the dashboard can show green while the Execution Worker refuses.
+        order_gate: dict[str, Any] | None = None
+        if db is not None:
+            from app.automation.gate import order_gate_summary
+
+            order_gate = order_gate_summary(db)
+        can_create_orders = (
+            bool(order_gate["allowed"]) if order_gate is not None else bool(persisted.get("can_create_orders", False))
+        )
         return {
             "running": bool(persisted.get("running", self.automation_running)),
             "paused": bool(persisted.get("paused", self.automation_paused)),
             "environment": persisted.get("environment", self.automation_environment),
             "auto_trading_enabled": settings.AUTO_TRADING_ENABLED,
-            "can_create_orders": bool(persisted.get("can_create_orders", False)),
+            "can_create_orders": can_create_orders,
+            "order_gate": order_gate,
             "revision": persisted.get("revision"),
             "pause_reason": persisted.get("pause_reason"),
             "manual_block_reason": persisted.get("manual_block_reason"),
@@ -151,28 +143,100 @@ class BackgroundWorkerManager:
                 "market_data", "scanner", "strategy_signal", "ai_trade_plan",
                 "risk_engine", "execution_engine", "portfolio_reconciliation", "journal",
             ],
-            "live_preflight": self.live_preflight_checklist(),
+            "live_preflight": self.live_preflight_checklist(db),
         }
 
-    def live_preflight_checklist(self) -> dict[str, Any]:
-        """Section 7 pre-live gate. All items must pass before Live can ever be enabled."""
-        items = [
-            {"item": "All P0 acceptance criteria passed", "passed": True},
-            {"item": "Exchange account and product eligibility confirmed", "passed": True},
-            {"item": "API key has Read+Trade only (no Withdraw)", "passed": True},
-            {"item": "Withdraw permission disabled", "passed": True},
-            {"item": "Exchange IP whitelist configured (if applicable)", "passed": False},
-            {"item": "Kill switch tested", "passed": True},
-            {"item": "Backup and restore drill passed", "passed": True},
-            {"item": "Live mode explicitly confirmed by the operator", "passed": settings.LIVE_TRADING_ENABLED},
-            {"item": "User understands losses may exceed the configured risk budget", "passed": settings.LIVE_TRADING_ENABLED},
-        ]
+    def live_preflight_checklist(self, db: Session | None = None) -> dict[str, Any]:
+        """Section 7 pre-live gate.
+
+        Every item is either measured from durable state or explicitly marked as an
+        unverified manual attestation. Hard-coding `passed: True` for things the system
+        never checked (API key permissions, kill-switch rehearsal, backup drill) made the
+        checklist decorative: it looked complete while proving nothing.
+
+        A live environment can therefore only become `ready` when every measured item
+        passes AND every manual attestation has been replaced by a real verifier.
+        """
+        measured: list[dict[str, Any]] = []
+        manual: list[dict[str, Any]] = []
+
+        withdraw_ok: bool | None = None
+        whitelist_ok: bool | None = None
+        if db is not None:
+            from sqlalchemy import select as _select
+
+            from app.models.entities import ExchangeConnection as _Conn
+
+            connections = list(db.scalars(_select(_Conn)).all())
+            if connections:
+                withdraw_ok = all(not bool(c.has_withdraw_permission) for c in connections)
+                whitelist_ok = all(bool(c.ip_whitelist_configured) for c in connections)
+
+        measured.append(
+            {
+                "item": "API keys hold no withdraw permission",
+                "passed": withdraw_ok is True,
+                "source": "exchange_connections.has_withdraw_permission",
+                "verified": withdraw_ok is not None,
+            }
+        )
+        measured.append(
+            {
+                "item": "Exchange IP whitelist configured (if applicable)",
+                "passed": whitelist_ok is True,
+                "source": "exchange_connections.ip_whitelist_configured",
+                "verified": whitelist_ok is not None,
+            }
+        )
+        measured.append(
+            {
+                "item": "Live mode explicitly enabled by the operator",
+                "passed": bool(settings.LIVE_TRADING_ENABLED),
+                "source": "LIVE_TRADING_ENABLED",
+                "verified": True,
+            }
+        )
+
+        for name in (
+            "All P0 acceptance criteria passed",
+            "Exchange account and product eligibility confirmed",
+            "Kill switch rehearsal completed",
+            "Backup and restore drill completed",
+            "Operator understands losses may exceed the configured risk budget",
+        ):
+            manual.append(
+                {
+                    "item": name,
+                    "passed": False,
+                    "source": "manual_attestation",
+                    "verified": False,
+                }
+            )
+
+        items = measured + manual
         return {
-            "ready": all(i["passed"] for i in items) and settings.LIVE_TRADING_ENABLED,
+            "ready": all(i["passed"] and i.get("verified", False) for i in items)
+            and bool(settings.LIVE_TRADING_ENABLED),
             "environment_variable_live_enabled": settings.LIVE_TRADING_ENABLED,
             "items": items,
-            "note": "Live trading stays OFF until every item passes and the operator confirms explicitly.",
+            "unverified_manual_items": [i["item"] for i in manual],
+            "note": (
+                "Live trading stays OFF. Unverified items are reported as failed rather than "
+                "assumed true; each must be replaced by a real check before Live can be enabled."
+            ),
         }
+
+    def get_worker_readiness(self, db: Session | None = None) -> dict[str, Any]:
+        """Readiness summary across required worker roles (additive API).
+
+        Returns {"ready": None, "detail": "no database session"} when there is
+        no persisted-state session available.
+        """
+        if db is None:
+            return {"ready": None, "detail": "no database session"}
+        from app.core.runtime_state import runtime_state
+
+        return runtime_state.readiness_summary(db)
 
     def get_workers_status(self, db: Session | None = None) -> list[dict[str, Any]]:
         if db is not None:

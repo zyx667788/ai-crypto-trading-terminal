@@ -1,5 +1,9 @@
 # 模拟盘验收报告 (ACCEPTANCE_REPORT.md)
 
+> **版本说明（V1.2.1 更新）**：本文件是 **V1.1** 的模拟盘验收快照，文中"140 项测试"等数字属于 V1.1 口径，不代表当前代码状态。
+> 当前状态请看 [V1.2 第一阶段验收报告](V1.2_PHASE1_ACCEPTANCE.md)（203 项）与
+> [V1.2.1 复审整改报告](V1.2.1_REVIEW_REMEDIATION.md)（266 项，含仍未修复的 P0 清单）。
+
 - **系统版本**：AI Crypto Trading Terminal V1.1（Mac mini 16GB 24h 运行版）
 - **报告类型**：模拟盘系统验收与就绪评估报告 (Paper-Trading Acceptance Report)
 - **验收环境**：Windows 11 本地开发验证环境 + macOS 目标部署架构（launchd + Homebrew native PostgreSQL/Redis）

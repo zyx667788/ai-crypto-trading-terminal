@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 from app.api.v1.router import api_router
+from app.core.admin_auth import AdminGuardMiddleware, parse_allowed_origins
 from app.core.config import DATA_DIR, LOGS_DIR, settings
 from app.core.events import CHANNELS, event_bus
 from app.core.logging import get_logger
@@ -93,14 +94,19 @@ app = FastAPI(
     redoc_url=None,
 )
 
+_cors_origins = parse_allowed_origins()
+if settings.WEB_URL and settings.WEB_URL not in _cors_origins:
+    _cors_origins.append(settings.WEB_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.WEB_URL, "http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+app.add_middleware(AdminGuardMiddleware)
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):

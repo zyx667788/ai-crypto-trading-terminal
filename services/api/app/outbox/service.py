@@ -33,7 +33,13 @@ Transaction boundary & concurrency semantics:
    - `nack` records `last_error` and calculates the next `available_at` based on `retry_delay`.
    - If `attempts >= max_attempts`, `nack` transitions the message to `DEAD`.
 
-4. `reclaim_expired`:
+4. `renew`:
+   - Extends an active lease in place without releasing ownership. Long-running order
+     tasks must call it before the lease expires, otherwise `reclaim_expired` will hand
+     the same message to a second worker while the first one is still executing.
+     Renewal never increments `attempts` and never mutates status.
+
+5. `reclaim_expired`:
    - Crash recovery: scans for messages stuck in `CLAIMED` status whose lease has expired.
    - Transitions messages with `attempts >= max_attempts` to `DEAD`.
    - Otherwise transitions them to `PENDING` with cleared lease metadata so other workers
@@ -324,6 +330,62 @@ class OutboxService:
             db.commit()
         return msg
 
+    def renew(
+        self,
+        db: Session,
+        message_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        *,
+        now: datetime | None = None,
+        auto_commit: bool = False,
+    ) -> OutboxMessage:
+        """
+        Extend an active lease without releasing it.
+
+        A single order task can outlive the initial lease (network retries, exchange
+        rate limits, reconciliation). Without renewal the message is reclaimed by
+        `reclaim_expired` and re-executed while the first worker is still running,
+        which is exactly the duplicate-submission window this queue is meant to close.
+
+        Only the current owner, holding an unexpired lease, may renew. Renewal never
+        increments `attempts` and never changes the message status.
+        """
+        if not worker_id:
+            raise ValueError("worker_id must not be empty")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+
+        stmt = select(OutboxMessage).where(OutboxMessage.id == message_id).with_for_update()
+        msg = db.execute(stmt).scalar_one_or_none()
+        if msg is None:
+            raise MessageNotFoundError(f"OutboxMessage {message_id} not found")
+
+        if msg.status != OutboxStatus.CLAIMED.value:
+            raise InvalidLeaseError(
+                f"Cannot renew message {message_id} in status {msg.status!r} (expected CLAIMED)"
+            )
+        if msg.claimed_by != worker_id:
+            raise InvalidLeaseError(
+                f"Worker {worker_id!r} does not hold lease for message {message_id} "
+                f"(currently claimed by {msg.claimed_by!r})"
+            )
+
+        current_time = _ensure_utc(now) or utc_now()
+        if msg.lease_expires_at is not None:
+            previous_expiry = _ensure_utc(msg.lease_expires_at)
+            if previous_expiry is not None and previous_expiry < current_time:
+                raise InvalidLeaseError(
+                    f"Lease for message {message_id} already expired at {previous_expiry}; "
+                    f"the message must be reclaimed before it can be renewed"
+                )
+
+        msg.lease_expires_at = current_time + timedelta(seconds=lease_seconds)
+        db.flush()
+        if auto_commit:
+            db.commit()
+        return msg
+
     def nack(
         self,
         db: Session,
@@ -452,5 +514,6 @@ outbox_service = OutboxService()
 enqueue = outbox_service.enqueue
 claim = outbox_service.claim
 ack = outbox_service.ack
+renew = outbox_service.renew
 nack = outbox_service.nack
 reclaim_expired = outbox_service.reclaim_expired

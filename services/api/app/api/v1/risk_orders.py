@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.events import event_bus
 from app.core.security import mask_secret
 from app.db.session import get_db
+from app.core.admin_auth import require_admin
 from app.execution.engine import execution_engine
 from app.models.entities import SystemEvent
 from app.portfolio.service import portfolio_service
@@ -48,14 +49,14 @@ def get_risk_events(limit: int = Query(default=50, ge=1, le=500), db: Session = 
     return risk_engine.get_risk_events(db, limit=limit)
 
 
-@router.post("/risk/kill-switch")
+@router.post("/risk/kill-switch", dependencies=[Depends(require_admin)])
 def activate_kill_switch(payload: KillSwitchRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     result = risk_engine.trigger_kill_switch(db, scope=payload.scope, reason=payload.reason)
     event_bus.publish_sync("risk", "risk.kill_switch_activated", result, source="risk")
     return result
 
 
-@router.post("/risk/resume")
+@router.post("/risk/resume", dependencies=[Depends(require_admin)])
 def resume_trading(payload: ResumeTradingRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
         result = risk_engine.resume_trading(db, scope=payload.scope, confirmation_code=payload.confirmation_code, reason=payload.reason)
@@ -65,7 +66,7 @@ def resume_trading(payload: ResumeTradingRequest, db: Session = Depends(get_db))
     return result
 
 
-@router.post("/risk/reset-daily-locks")
+@router.post("/risk/reset-daily-locks", dependencies=[Depends(require_admin)])
 def reset_daily_locks(payload: ResetDailyLocksRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     """
     Operator acknowledgement for the daily-loss / loss-streak lock (§3.7 rule 8).
@@ -84,7 +85,7 @@ def reset_daily_locks(payload: ResetDailyLocksRequest, db: Session = Depends(get
     return result
 
 
-@router.post("/risk/flatten")
+@router.post("/risk/flatten", dependencies=[Depends(require_admin)])
 def flatten_positions(account_id: str | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
     result = execution_engine.flatten_all_positions(db, account_id=account_id)
     event_bus.publish_sync("positions", "positions.flattened", result, source="execution")

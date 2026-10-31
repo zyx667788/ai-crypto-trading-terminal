@@ -49,11 +49,22 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
+  const isMutating = ["POST", "PUT", "PATCH", "DELETE"].includes((init?.method || "GET").toUpperCase());
+  const adminToken = process.env.NEXT_PUBLIC_ADMIN_TOKEN;
+  // Sec-Fetch-Site / Origin are set by the browser and cannot be spoofed from JS
+  // (they are forbidden headers). The backend relies on the real values, so we only
+  // add the optional admin token here.
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(isMutating && adminToken ? { "X-Admin-Token": adminToken } : {}),
+    ...((init?.headers as Record<string, string>) || {}),
+  };
   try {
     res = await fetch(`${API_ROOT}${path}`, {
       ...init,
       cache: "no-store",
-      headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+      credentials: "same-origin",
+      headers,
     });
   } catch (err) {
     throw new ApiError(0, err, "API unreachable — data status unknown (stale).");
@@ -579,8 +590,8 @@ export const api = {
   restoreCheck: () => post<Record<string, unknown>>("/api/v1/system/backups/restore-check"),
   recovery: () => get<RecoveryStatusPayload>("/api/v1/system/recovery"),
   runRecovery: () => post<RecoveryStatusPayload>("/api/v1/system/recovery/run?force=true"),
-  acknowledgeRecovery: (reason = "Operator reviewed reconciliation and protective orders") =>
-    post<RecoveryStatusPayload>(`/api/v1/system/recovery/acknowledge?reason=${encodeURIComponent(reason)}`),
+  acknowledgeRecovery: (reason = "Operator reviewed reconciliation and protective orders", confirm = true) =>
+    post<RecoveryStatusPayload>("/api/v1/system/recovery/acknowledge", { reason, confirm }),
 
   exchanges: () => get<Array<Record<string, unknown>>>("/api/v1/exchanges"),
   connections: () => get<ExchangeConnectionItem[]>("/api/v1/exchange-connections"),
@@ -687,10 +698,14 @@ export const api = {
     simulate_ai_invalid_json?: boolean;
     simulate_ai_timeout?: boolean;
     simulate_order_timeout?: boolean;
+    confirm?: boolean;
   }) => {
-    const q = new URLSearchParams();
-    Object.entries(opts || {}).forEach(([k, v]) => v && q.set(k, "true"));
-    return post<Record<string, unknown>>(`/api/v1/automation/run-cycle${q.toString() ? `?${q}` : ""}`);
+    return post<Record<string, unknown>>("/api/v1/automation/run-cycle", {
+      simulate_ai_invalid_json: Boolean(opts?.simulate_ai_invalid_json),
+      simulate_ai_timeout: Boolean(opts?.simulate_ai_timeout),
+      simulate_order_timeout: Boolean(opts?.simulate_order_timeout),
+      confirm: opts?.confirm ?? true,
+    });
   },
 
   analytics: () => get<AnalyticsSummaryPayload>("/api/v1/analytics/summary"),

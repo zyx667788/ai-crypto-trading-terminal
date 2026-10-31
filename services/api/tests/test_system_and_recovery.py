@@ -137,7 +137,22 @@ def test_recovery_never_auto_flattens_positions(seeded):
 
 
 def test_operator_acknowledge_clears_blockers(seeded):
+    """An operator blocker is liftable — but only once the technical checks pass.
+
+    `acknowledge_and_ready` deliberately re-runs the technical recovery checks
+    (see tests/test_recovery_acknowledge_recheck.py for the refusal cases), so this
+    test first removes residue left by other suites: an UNKNOWN order or an
+    unprotected open position is a real reason to stay blocked.
+    """
     db = seeded
+    from app.models.entities import Order
+
+    for order in db.execute(select(Order).where(Order.status == "UNKNOWN")).scalars().all():
+        db.delete(order)
+    for position in db.execute(select(Position).where(Position.status == "OPEN")).scalars().all():
+        db.delete(position)
+    db.commit()
+
     recovery_manager.force_block("simulated blocker")
     assert recovery_manager.get_status()["new_entries_blocked"] is True
     status = recovery_manager.acknowledge_and_ready("pytest operator acknowledgement")

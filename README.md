@@ -20,14 +20,15 @@
 - **跨进程控制面**：Automation Control、Recovery Checkpoint、Worker Heartbeat 全部数据库持久化；Pause、Kill Switch 与 Recovery 闸门由 API 和各 Worker 共同读取。
 - **可靠执行面**：PostgreSQL Transactional Outbox + 租约认领；API/Market Worker 只生产 `execution.order` 任务，Execution Worker 独立消费。`client_order_id` 保证崩溃重放不重复下单。
 - **安全默认**：`AUTO_TRADING_ENABLED=false` 时任何 Worker 都不能创建新订单；`force_live` 绕过路径已删除；Live 继续关闭。
-- **验证**：203 项测试通过，其中 6 项为真实 PostgreSQL + OS 多进程/崩溃恢复；PostgreSQL 全链路迁移与两轮 QUEUED→FILLED 复验通过。
-- **详细清单**：见 [V1.2 第一阶段验收报告](docs/V1.2_PHASE1_ACCEPTANCE.md)。
+- **验证**：266 项测试（265 通过 + 1 项仅 POSIX 的文件权限断言在 Windows 跳过），其中 6 项为真实 PostgreSQL + OS 多进程/崩溃恢复；PostgreSQL 全链路迁移与两轮 QUEUED→FILLED 复验通过。
+- **详细清单**：见 [V1.2 第一阶段验收报告](docs/V1.2_PHASE1_ACCEPTANCE.md) 与 [V1.2.1 复审整改报告](docs/V1.2.1_REVIEW_REMEDIATION.md)。
+- **复审整改（V1.2.1）**：生产模式强制 PostgreSQL、管理 API 增加 Origin/Host/Token 防护、下单账户与 environment 强绑定、Recovery 人工确认必须重跑技术校验、就绪等级分级（最高 SIMULATED_READY）、SecretVault 主密钥写入回读校验、Worker 心跳过期判定、统一下单闸门、Outbox 租约续期。**仍未修复的 P0 见整改报告第 4 节**（真实交易所 Adapter、下单双写窗口等）。
 
 ## V1.1 已实现能力
 
 - **后端架构**：FastAPI + SQLAlchemy 2.0 + Alembic，V1.1 的 24 张核心业务表（V1.2 第一阶段新增 4 张协调表），全模块已实现 —— Market Data、Scanner、Strategy、AI Orchestrator、Risk Engine、Execution Engine、Portfolio Reconciliation、Journal & Backtest、Background Workers。
 - **前端暗色终端**：Next.js 14 App Router + Tailwind CSS，8 大导航板块（Overview 总览、Exchanges 交易所连接、Markets 市场与行情、AI System 智能体控制台、Trading 交易执行、Risk Center 风控中心、Analytics 绩效与回测、Settings 系统与运维）。
-- **自动化测试**：**140 个 pytest 测试全部 Passed**，覆盖精度计算、10 大硬性风控规则、订单状态机与幂等、AI 结构化输出与超时拦截、AI Provider 适配器（JSON 契约/超时/截断/密钥隔离/过期策略）、组合账务不变量、冷启动恢复状态机、备份恢复演练及 REST/WebSocket 冒烟测试。
+- **自动化测试**：**266 项 pytest 测试（265 通过 / 1 项 Windows 跳过）**，覆盖精度计算、10 大硬性风控规则、订单状态机与幂等、AI 结构化输出与超时拦截、AI Provider 适配器（JSON 契约/超时/截断/密钥隔离/过期策略）、组合账务不变量、冷启动恢复状态机、备份恢复演练及 REST/WebSocket 冒烟测试。
 - **AI Provider**：支持任意 OpenAI 兼容 `/v1/chat/completions` 端点（`AI_PROVIDER=openai_compatible`），或使用确定性规则模板离线运行（`rule_assisted_mock`，默认，亦为测试模式）。Provider 实测成功时单次 TradePlan 生成约 11-12 秒、约 2400 tokens、成本 ≈ $0.0035。设置页可直接「测试连接」。
 - **常驻部署与运维**：面向 macOS Apple Silicon Mac mini 16GB，提供 7 个原生 `launchd` plist 守护配置与运维脚本（`make install-services` / `start` / `stop` / `status` / `backup` / `restore-check` / `reconcile` / `kill-switch`），避免 Docker Desktop 虚拟化层常驻开销。
 - **明确安全说明**：系统**默认以 Demo 确定性模拟执行模式运行**，实盘开关全局锁定（`LIVE_TRADING_ENABLED=false`），任何实盘开仓均需操作者在硬件、网络与权限均就绪后显式人工确认。
@@ -68,7 +69,7 @@
 │       │   ├── journal/          # 交易复盘、绩效统计与历史回测引擎
 │       │   └── workers/          # 后台任务调度与 launchd Worker 入口
 │       ├── alembic/              # 数据库 Schema 迁移脚本
-│       └── tests/                # 单元、集成与故障注入测试 (140 passed)
+│       └── tests/                # 单元、集成与故障注入测试 (265 passed / 1 skipped)
 ├── packages/
 │   └── shared-contracts/         # 前后端共享 TypeScript 类型定义
 ├── infra/
@@ -92,7 +93,29 @@
 cp .env.example .env
 ```
 
-### 2. 启动基础服务（可选）
+### 2. 生产环境数据库要求与初始化 (Production Requires PostgreSQL)
+
+生产环境与多进程后台 Worker 严格要求使用 **PostgreSQL 14+**。由于多进程架构（API、Market Worker、Execution Worker、Recovery Watchdog）依赖 PostgreSQL 的行级排他锁与事务 Outbox 消费机制（`FOR UPDATE SKIP LOCKED`），SQLite 无法提供跨进程锁语义。后台 Worker 启动时会强制执行数据库策略检查，拒绝在未显式授权的 SQLite 上启动。
+
+连接字符串格式：`postgresql+psycopg://<user>:<password>@<host>:<port>/<dbname>`
+
+```bash
+# 1. 本地初始化（以 macOS / Linux 本地 PostgreSQL 为例）
+initdb -D /usr/local/var/postgres
+createuser -s terminal_user
+createdb -O terminal_user ai_crypto_terminal
+
+# 2. 配置环境变量 (.env)
+# DATABASE_URL=postgresql+psycopg://terminal_user:strong_password@127.0.0.1:5432/ai_crypto_terminal
+
+# 3. 执行数据库迁移同步至最新 Head
+cd services/api
+alembic upgrade head
+```
+
+> **本地开发说明**：若未安装 PostgreSQL，API 进程在开发/测试环境下仍可使用 `data/terminal.db`（SQLite）。但多进程 Worker 若要连接 SQLite 进行单进程本地调试，必须显式传递 `--allow-unsafe-sqlite` 命令行逃生参数（**NOT SAFE FOR MULTI-PROCESS**）。
+
+### 3. 启动基础服务（Docker 辅助模式）
 
 若已安装 Docker Desktop / OrbStack（**仅开发与集成测试需要**）：
 
