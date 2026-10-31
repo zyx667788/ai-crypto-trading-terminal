@@ -20,8 +20,8 @@ def system_status() -> dict[str, Any]:
 
 
 @router.get("/system/recovery")
-def get_recovery() -> dict[str, Any]:
-    return recovery_manager.get_status()
+def get_recovery(db: Session = Depends(get_db)) -> dict[str, Any]:
+    return recovery_manager.get_status(db)
 
 
 @router.post("/system/recovery/run")
@@ -31,7 +31,7 @@ def run_recovery(force: bool = False, db: Session = Depends(get_db)) -> dict[str
 
 @router.post("/system/recovery/acknowledge")
 def acknowledge_recovery(reason: str = "Operator reviewed reconciliation and protective orders", db: Session = Depends(get_db)) -> dict[str, Any]:
-    return recovery_manager.acknowledge_and_ready(reason)
+    return recovery_manager.acknowledge_and_ready(reason, db=db)
 
 
 @router.get("/system/events")

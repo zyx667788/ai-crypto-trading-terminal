@@ -73,6 +73,7 @@ def main() -> int:
     os.environ["TERMINAL_MASTER_KEY"] = Fernet.generate_key().decode()
     os.environ["AI_API_KEY"] = ""
     os.environ["AI_PROVIDER"] = "rule_assisted_mock"
+    os.environ["AUTO_TRADING_ENABLED"] = "true"
 
     # Re-import app modules now that DATABASE_URL points at PostgreSQL.
     for mod in [m for m in list(sys.modules) if m.startswith("app.")]:
@@ -177,14 +178,19 @@ def main() -> int:
     print("\n[6] Full pipeline (real Risk Engine + Execution on PostgreSQL)")
     from app.core.recovery import recovery_manager
     from app.workers.scheduler import worker_manager
+    from app.automation import control as automation_control
+    from app.workers.execution import run_execution_worker_once
 
     with SessionLocal() as db:
         recovery_manager.run_recovery(db, force=True)
-        for _ in range(2):
+        automation_control.start(db, environment="demo", actor="pg-integration")
+        for index in range(2):
             summary = worker_manager.run_automation_cycle(db)
             blocked = summary.get("blocked_reason")
-            order_status = (summary.get("order") or {}).get("status")
-            print(f"  cycle: blocked={blocked!r} order={order_status}")
+            queued = summary.get("order") or {}
+            executed = run_execution_worker_once(db, worker_id=f"pg-execution-{index}")
+            order_status = (executed.get("orders") or [{}])[0].get("status") if executed.get("orders") else None
+            print(f"  cycle: blocked={blocked!r} queued={queued.get('status')} executed={order_status}")
             if blocked:
                 failures.append(f"cycle blocked: {blocked}")
 

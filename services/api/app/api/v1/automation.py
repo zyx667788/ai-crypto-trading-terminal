@@ -20,16 +20,18 @@ LIVE_CONFIRMATION_PHRASE = "I UNDERSTAND LIVE TRADING RISK"
 
 # ----------------------------------------------------------------- automation
 @router.get("/automation/status")
-def automation_status() -> dict[str, Any]:
+def automation_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {
-        **worker_manager.get_automation_status(),
-        "recovery": recovery_manager.get_status(),
-        "workers": worker_manager.get_workers_status(),
+        **worker_manager.get_automation_status(db),
+        "recovery": recovery_manager.get_status(db),
+        "workers": worker_manager.get_workers_status(db),
     }
 
 
 @router.post("/automation/start")
-def start_automation(payload: AutomationControlRequest) -> dict[str, Any]:
+def start_automation(payload: AutomationControlRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
+    if not settings.AUTO_TRADING_ENABLED:
+        raise HTTPException(status_code=403, detail="Automation is disabled (AUTO_TRADING_ENABLED=false).")
     if payload.environment == "live":
         if not settings.LIVE_TRADING_ENABLED:
             raise HTTPException(
@@ -41,17 +43,20 @@ def start_automation(payload: AutomationControlRequest) -> dict[str, Any]:
         checklist = worker_manager.live_preflight_checklist()
         if not checklist["ready"]:
             raise HTTPException(status_code=403, detail={"message": "Live pre-flight checklist incomplete.", "checklist": checklist})
-    if not recovery_manager.is_ready():
+    if not recovery_manager.is_ready(db):
         # Recovery must complete first; entering automation without a reconciled state is unsafe.
-        raise HTTPException(status_code=409, detail={"message": "Recovery is not READY.", "recovery": recovery_manager.get_status()})
-    result = worker_manager.start_automation(payload.environment)
+        raise HTTPException(status_code=409, detail={"message": "Recovery is not READY.", "recovery": recovery_manager.get_status(db)})
+    try:
+        result = worker_manager.start_automation(db, payload.environment)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     event_bus.publish_sync("agents", "automation.started", result, source="automation")
     return result
 
 
 @router.post("/automation/pause")
-def pause_automation() -> dict[str, Any]:
-    result = worker_manager.pause_automation()
+def pause_automation(db: Session = Depends(get_db)) -> dict[str, Any]:
+    result = worker_manager.pause_automation(db)
     event_bus.publish_sync("agents", "automation.paused", result, source="automation")
     return result
 
@@ -61,7 +66,6 @@ def run_automation_cycle(
     simulate_ai_invalid_json: bool = False,
     simulate_ai_timeout: bool = False,
     simulate_order_timeout: bool = False,
-    force_live: bool = False,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     return worker_manager.run_automation_cycle(
@@ -69,7 +73,6 @@ def run_automation_cycle(
         simulate_ai_invalid_json=simulate_ai_invalid_json,
         simulate_ai_timeout=simulate_ai_timeout,
         simulate_order_timeout=simulate_order_timeout,
-        force_live=force_live,
     )
 
 

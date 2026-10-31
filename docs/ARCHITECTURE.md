@@ -1,5 +1,7 @@
 # 系统架构文档 (ARCHITECTURE.md)
 
+> **V1.2 第一阶段更新**：跨进程控制面已改为 PostgreSQL 持久化 Automation Control / Recovery Checkpoint / Worker Heartbeat；订单执行采用 PostgreSQL Transactional Outbox，Execution Worker 独立认领消费。详见 [V1.2 第一阶段验收报告](V1.2_PHASE1_ACCEPTANCE.md)。Redis 不再是订单任务可靠性的必需依赖。
+
 ## 1. 架构模式
 采用 **模块化单体（Modular Monolith）+ 后台异步任务调度（Background Workers）** 架构，通过本地 loopback 网络通信：
 - **Web 前端**：Next.js + React + TypeScript + Tailwind CSS（运行于 `http://localhost:3000`）。

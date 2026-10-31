@@ -58,10 +58,10 @@
 - `GET /api/v1/portfolio/summary` - Dashboard 资产与盈亏总览
 
 ## 5. 自动化、分析、复盘与回测 (Automation, Analytics, Journal & Backtests)
-- `GET /api/v1/automation/status` - 自动交易流水线状态及实盘解锁检查清单
-- `POST /api/v1/automation/start` - 启动自动交易闭环（支持 Demo 流水线演练；Live 需通过前置检查与二次确认码）
-- `POST /api/v1/automation/pause` - 暂停自动新开仓
-- `POST /api/v1/automation/run-cycle` - 手动执行一次完整“扫描 -> 策略信号 -> AI TradePlan -> 风控审核 -> 模拟执行 -> 复盘”闭环
+- `GET /api/v1/automation/status` - 从数据库读取 Automation Control、Recovery Checkpoint 与各进程 Worker Heartbeat
+- `POST /api/v1/automation/start` - 启动自动交易闭环；`AUTO_TRADING_ENABLED=false` 时返回 403，Live 仍需前置检查与二次确认
+- `POST /api/v1/automation/pause` - 持久化暂停自动新开仓，所有 Worker 进程下一轮立即生效
+- `POST /api/v1/automation/run-cycle` - 执行“扫描 -> 策略信号 -> AI TradePlan -> Outbox 入队 -> 复盘”；**不在 API 进程内下单**，订单任务由 Execution Worker 消费
 - `GET /api/v1/analytics/summary` - 综合绩效统计（胜率、盈亏比、夏普、最大回撤、费用占比）
 - `GET /api/v1/analytics/equity-curve` - 账户净值曲线序列
 - `GET /api/v1/analytics/strategy-performance` - 各策略与各交易所维度表现对比

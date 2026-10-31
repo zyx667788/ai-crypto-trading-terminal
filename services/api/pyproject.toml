@@ -42,3 +42,6 @@ include = ["app*"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["."]
+markers = [
+    "integration: real PostgreSQL and multi-process integration tests",
+]

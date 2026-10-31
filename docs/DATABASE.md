@@ -10,7 +10,7 @@
    - `market_candles`: `UniqueConstraint("exchange", "market_type", "symbol", "timeframe", "open_time")`
 4. **追加式审计**：订单状态流转、成交明细（`fills`）、风险事件（`risk_events`）、审计日志（`audit_logs`）均为追加记录，不无痕覆盖历史。
 
-## 2. 23 张核心数据表清单
+## 2. 28 张核心数据表清单
 1. `exchange_connections`: 交易所 API 连接、环境标识（`demo`/`testnet`/`live`）、密文引用、提现权限检测状态。
 2. `trading_accounts`: 交易账户、所属地区、产品资格（Spot / USDT Perp）与对账状态。
 3. `instruments`: 标准化交易对与交易规则（`tick_size`, `lot_size`, `min_qty`, `min_notional`, `contract_size`）。
@@ -35,3 +35,7 @@
 22. `backtest_runs`: 历史回测配置、样本区间与绩效结果表。
 23. `kill_switch_states`: 全局或账户级紧急熔断开关状态表。
 24. `journal_entries`: 交易全链路复盘记录表（关联信号、AI 决策、风控、订单、成交与复盘摘要）。
+25. `automation_controls` (V1.2): 单例自动化控制行，持久化 running、paused、environment、revision 与人工阻断原因。
+26. `outbox_messages` (V1.2): Transactional Outbox；唯一 `dedup_key`、认领 owner、attempts、租约、重试与 DEAD 状态。
+27. `recovery_checkpoints` (V1.2): 跨进程恢复状态、阻断原因、步骤、计数与 revision。
+28. `worker_heartbeats` (V1.2): 各 Worker 进程的 role、worker_id、host/pid、健康状态、错误与最近心跳。

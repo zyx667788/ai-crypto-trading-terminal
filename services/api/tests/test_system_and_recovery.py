@@ -244,7 +244,27 @@ def test_websocket_channels_all_exist(client):
             assert ack["occurred_at"]
 
 
-def test_end_to_end_automation_cycle_completes(client):
+def test_end_to_end_automation_cycle_completes(client, monkeypatch):
+    from app.automation import control as automation_control
+    from app.core.config import settings
+    from app.core.precision import utc_now
+    from app.core.runtime_state import runtime_state
+    from app.db.session import SessionLocal
+
+    monkeypatch.setattr(settings, "AUTO_TRADING_ENABLED", True)
+    with SessionLocal() as db:
+        automation_control.start(db, environment="demo", actor="pytest")
+        runtime_state.save_recovery(
+            db,
+            {
+                "state": "READY",
+                "new_entries_blocked_due_to": [],
+                "steps": [],
+                "counts": {},
+                "started_at": utc_now().isoformat(),
+                "completed_at": utc_now().isoformat(),
+            },
+        )
     res = client.post("/api/v1/automation/run-cycle")
     assert res.status_code == 200
     payload = res.json()
@@ -262,3 +282,6 @@ def test_end_to_end_automation_cycle_completes(client):
     ):
         assert required in steps
     assert all(s["ok"] for s in payload["steps"]), payload["steps"]
+    if payload.get("order") is not None:
+        assert payload["order"]["status"] == "QUEUED"
+        assert payload["order"]["consumer"] == "execution-worker"

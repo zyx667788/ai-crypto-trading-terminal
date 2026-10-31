@@ -63,26 +63,89 @@ class BackgroundWorkerManager:
         self.started_at = utc_now()
 
     # --------------------------------------------------------------- lifecycle
-    def start_automation(self, environment: str = "demo") -> dict[str, Any]:
-        self.automation_running = True
-        self.automation_paused = False
-        self.automation_environment = environment
-        return self.get_automation_status()
+    def start_automation(self, db: Session, environment: str = "demo") -> dict[str, Any]:
+        from app.automation import control as automation_control
 
-    def pause_automation(self, reason: str = "Operator paused new entries") -> dict[str, Any]:
-        self.automation_paused = True
+        return dict(automation_control.start(db, environment=environment, actor="local_admin"))
+
+    def pause_automation(
+        self,
+        db: Session,
+        reason: str = "Operator paused new entries",
+    ) -> dict[str, Any]:
+        from app.automation import control as automation_control
+
+        result = dict(automation_control.pause(db, reason=reason, actor="local_admin"))
         self.cycle_history.appendleft({"event": "paused", "reason": reason, "at": utc_iso()})
-        return self.get_automation_status()
+        return result
 
-    def get_automation_status(self) -> dict[str, Any]:
+    def new_order_gate(self, db: Session) -> tuple[bool, str]:
+        """One durable gate shared by every producer and the Execution Worker."""
+        from app.automation import control as automation_control
+        from app.core.recovery import recovery_manager
+        from app.models.entities import KillSwitchState
+
+        if not settings.AUTO_TRADING_ENABLED:
+            return False, "AUTO_TRADING_DISABLED"
+        try:
+            status = automation_control.get_status(db)
+            global_kill = db.scalar(
+                select(KillSwitchState).where(
+                    KillSwitchState.scope == "global",
+                    KillSwitchState.enabled.is_(True),
+                )
+            )
+            if global_kill is not None:
+                return False, f"KILL_SWITCH_ACTIVE: {global_kill.reason}"
+            if status.get("manual_block_reason"):
+                return False, f"MANUAL_BLOCK: {status['manual_block_reason']}"
+            if not status.get("running"):
+                return False, "AUTOMATION_NOT_RUNNING"
+            if status.get("paused"):
+                return False, f"AUTOMATION_PAUSED: {status.get('pause_reason') or 'operator pause'}"
+            if not recovery_manager.is_ready(db):
+                return False, "RECOVERY_NOT_READY"
+            return True, "READY"
+        except Exception as exc:
+            logger.error("durable order gate failed closed", extra={"structured_data": {"error": str(exc)}})
+            return False, f"ORDER_GATE_FAIL_CLOSED: {exc}"
+
+    def get_automation_status(self, db: Session | None = None) -> dict[str, Any]:
+        persisted: dict[str, Any] = {}
+        cycle_count = len(self.cycle_history)
+        last_summary = self.last_cycle_summary
+        last_at = self.last_cycle_at
+        if db is not None:
+            from app.automation import control as automation_control
+            from sqlalchemy import func
+
+            persisted = dict(automation_control.get_status(db))
+            cycle_count = db.scalar(
+                select(func.count()).select_from(SystemEvent).where(SystemEvent.component == "automation")
+            ) or 0
+            latest = db.scalar(
+                select(SystemEvent)
+                .where(SystemEvent.component == "automation")
+                .order_by(SystemEvent.created_at.desc())
+                .limit(1)
+            )
+            if latest is not None:
+                last_at = utc_iso(latest.created_at)
+                last_summary = {"event_type": latest.event_type, **dict(latest.payload or {})}
         return {
-            "running": self.automation_running,
-            "paused": self.automation_paused,
-            "environment": self.automation_environment,
+            "running": bool(persisted.get("running", self.automation_running)),
+            "paused": bool(persisted.get("paused", self.automation_paused)),
+            "environment": persisted.get("environment", self.automation_environment),
+            "auto_trading_enabled": settings.AUTO_TRADING_ENABLED,
+            "can_create_orders": bool(persisted.get("can_create_orders", False)),
+            "revision": persisted.get("revision"),
+            "pause_reason": persisted.get("pause_reason"),
+            "manual_block_reason": persisted.get("manual_block_reason"),
+            "control_updated_at": persisted.get("updated_at"),
             "live_trading_enabled": settings.LIVE_TRADING_ENABLED,
-            "last_cycle_at": self.last_cycle_at,
-            "last_cycle_summary": self.last_cycle_summary,
-            "cycles_executed": len(self.cycle_history),
+            "last_cycle_at": last_at,
+            "last_cycle_summary": last_summary,
+            "cycles_executed": cycle_count,
             "started_at": utc_iso(self.started_at),
             "pipeline": [
                 "market_data", "scanner", "strategy_signal", "ai_trade_plan",
@@ -111,8 +174,13 @@ class BackgroundWorkerManager:
             "note": "Live trading stays OFF until every item passes and the operator confirms explicitly.",
         }
 
-    def get_workers_status(self) -> list[dict[str, Any]]:
-        now = utc_now()
+    def get_workers_status(self, db: Session | None = None) -> list[dict[str, Any]]:
+        if db is not None:
+            from app.core.runtime_state import runtime_state
+
+            persisted = runtime_state.list_workers(db)
+            if persisted:
+                return persisted
         result = []
         for w in self.workers.values():
             result.append({
@@ -149,11 +217,9 @@ class BackgroundWorkerManager:
         simulate_ai_invalid_json: bool = False,
         simulate_ai_timeout: bool = False,
         simulate_order_timeout: bool = False,
-        force_live: bool = False,
     ) -> dict[str, Any]:
         from app.ai.service import ai_service
         from app.core.recovery import recovery_manager
-        from app.execution.engine import execution_engine
         from app.exchanges.registry import ensure_default_demo_connections
         from app.market_data.service import market_data_service
         from app.portfolio.service import portfolio_service
@@ -161,12 +227,20 @@ class BackgroundWorkerManager:
         from app.scanner.service import scanner_service
         from app.strategies.service import strategy_service
 
+        from app.automation import control as automation_control
+
         started = time.perf_counter()
         steps: list[dict[str, Any]] = []
-        environment = "live" if force_live else self.automation_environment
+        environment = automation_control.get_status(db).get("environment", "demo")
 
         def step(name: str, ok: bool, detail: Any) -> None:
             steps.append({"step": name, "ok": ok, "detail": detail, "at": utc_iso()})
+
+        # ---- durable cross-process gate: AUTO flag, pause, kill switch, recovery
+        allowed, gate_reason = self.new_order_gate(db)
+        if not allowed:
+            step("automation_gate", False, gate_reason)
+            return self._finish_cycle(db, steps, started, blocked_reason=gate_reason)
 
         # ---- environment gate
         if environment == "live" and not settings.LIVE_TRADING_ENABLED:
@@ -174,7 +248,7 @@ class BackgroundWorkerManager:
             return self._finish_cycle(db, steps, started, blocked_reason="LIVE_LOCKED")
 
         # ---- recovery gate
-        if not recovery_manager.is_ready():
+        if not recovery_manager.is_ready(db):
             step("recovery_gate", False, "Recovery state is not READY; new entries are blocked.")
             return self._finish_cycle(db, steps, started, blocked_reason="RECOVERY_NOT_READY")
 
@@ -255,25 +329,38 @@ class BackgroundWorkerManager:
         if ai_error and signals:
             return self._finish_cycle(db, steps, started, blocked_reason="AI_FAIL_CLOSED")
 
-        # ---- 5. risk + execution
+        # ---- 5. enqueue execution; only the Execution Worker may submit the order
         order_result = None
         if decision is not None:
             try:
-                order_result = execution_engine.submit_trade_plan(
+                from app.workers.execution import enqueue_order_task
+
+                client_order_id = f"auto-{decision.decision_id}"
+                message = enqueue_order_task(
                     db,
-                    decision.trade_plan,
+                    trade_plan=decision.trade_plan.model_dump(mode="json"),
                     decision_id=decision.decision_id,
                     signal_id=signals[0].id if signals else None,
+                    client_order_id=client_order_id,
                     simulate_timeout=simulate_order_timeout,
                 )
-                step("risk_engine", bool(order_result.get("approved", True)), order_result.get("risk_check", order_result.get("status")))
-                step("execution_engine", order_result.get("status") not in ("REJECTED", None), order_result.get("status"))
+                db.commit()
+                order_result = {
+                    "status": "QUEUED",
+                    "outbox_id": message.id,
+                    "client_order_id": client_order_id,
+                    "consumer": "execution-worker",
+                }
+                step("risk_engine", True, "Risk evaluation is deferred to the Execution Worker immediately before submission.")
+                step("execution_engine", True, order_result)
             except Exception as exc:
-                step("risk_engine", False, f"Risk/execution error: {exc}")
+                db.rollback()
+                step("risk_engine", False, f"Outbox enqueue failed: {exc}")
                 step("execution_engine", False, str(exc))
+                return self._finish_cycle(db, steps, started, blocked_reason="OUTBOX_ENQUEUE_FAILED")
         else:
             step("risk_engine", True, "No TradePlan to evaluate.")
-            step("execution_engine", True, "No order submitted.")
+            step("execution_engine", True, "No order task enqueued.")
         self._mark("ExecutionWorker", "OK", int((time.perf_counter() - started) * 1000))
 
         # ---- 6. reconciliation + snapshot
@@ -355,30 +442,101 @@ class BackgroundWorkerManager:
         event_bus.publish_sync("agents", "automation.cycle_completed", summary, source="automation")
         return summary
 
-    def run_background_loop(self, role: str) -> None:  # pragma: no cover - long running
-        """Entry point used by launchd-supervised worker processes."""
-        from app.db.session import SessionLocal
-        from app.core.recovery import recovery_manager
+    def run_worker_once(self, role: str, db: Session, *, worker_id: str, lease_seconds: int = 60) -> dict[str, Any]:
+        """Execute one bounded worker iteration; used by both launchd and integration tests."""
+        from app.core.runtime_state import runtime_state
 
+        started = time.perf_counter()
+        if role == "execution-worker":
+            from app.workers.execution import run_execution_worker_once
+
+            return run_execution_worker_once(db, worker_id=worker_id, lease_seconds=lease_seconds)
+
+        if role == "recovery-watchdog":
+            from app.core.recovery import recovery_manager
+
+            status = recovery_manager.run_recovery(db)
+            result = {"recovery_state": status["state"], "blocked": status["new_entries_blocked"]}
+            runtime_state.heartbeat(
+                db,
+                role=role,
+                worker_id=worker_id,
+                status="OK",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                details=result,
+            )
+            return result
+
+        if role == "market-worker":
+            allowed, reason = self.new_order_gate(db)
+            if allowed:
+                summary = self.run_automation_cycle(db)
+                runtime_state.heartbeat(
+                    db,
+                    role=role,
+                    worker_id=worker_id,
+                    status="OK" if not summary.get("blocked_reason") else "FAILED",
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    details={"cycle_id": summary.get("cycle_id"), "blocked_reason": summary.get("blocked_reason")},
+                )
+                return summary
+            # Monitoring continues while trading is paused; only new-order production stops.
+            from app.market_data.service import market_data_service
+
+            refresh = market_data_service.sync_all_default_markets(db, timeframe="15m", limit=120)
+            result = {"blocked_reason": reason, "market_data": refresh}
+            runtime_state.heartbeat(
+                db,
+                role=role,
+                worker_id=worker_id,
+                status="SKIPPED",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                details={"blocked_reason": reason},
+            )
+            return result
+
+        raise ValueError(f"Unknown worker role: {role}")
+
+    def run_background_loop(
+        self,
+        role: str,
+        *,
+        worker_id: str | None = None,
+        once: bool = False,
+        lease_seconds: int = 60,
+    ) -> None:  # pragma: no cover - long running
+        """Entry point used by launchd-supervised worker processes."""
+        import os
+        import socket
+        from app.core.runtime_state import runtime_state
+        from app.db.session import SessionLocal
+
+        identity = worker_id or f"{role}-{socket.gethostname()}-{os.getpid()}"
         interval = {
             "market-worker": 15,
             "execution-worker": 10,
             "recovery-watchdog": 30,
         }.get(role, 60)
 
-        logger.info("worker loop starting", extra={"structured_data": {"role": role, "interval": interval}})
+        logger.info("worker loop starting", extra={"structured_data": {"role": role, "worker_id": identity, "interval": interval}})
+        with SessionLocal() as db:
+            runtime_state.heartbeat(db, role=role, worker_id=identity, status="STARTING")
         while True:
             with SessionLocal() as db:
                 try:
-                    if role == "recovery-watchdog":
-                        recovery_manager.run_recovery(db)
-                    elif role == "execution-worker":
-                        # Execution only reacts to queued risk-approved requests; nothing to do when idle.
-                        self._mark("ExecutionWorker", "OK", 0)
-                    else:
-                        self.run_automation_cycle(db)
+                    self.run_worker_once(role, db, worker_id=identity, lease_seconds=lease_seconds)
                 except Exception as exc:
-                    logger.exception("worker cycle failed", extra={"structured_data": {"role": role, "error": str(exc)}})
+                    db.rollback()
+                    logger.exception("worker cycle failed", extra={"structured_data": {"role": role, "worker_id": identity, "error": str(exc)}})
+                    runtime_state.heartbeat(
+                        db,
+                        role=role,
+                        worker_id=identity,
+                        status="FAILED",
+                        error=str(exc),
+                    )
+            if once:
+                return
             time.sleep(interval)
 
 

@@ -21,8 +21,16 @@ def main() -> int:
         choices=["market-worker", "execution-worker", "recovery-watchdog"],
         help="Worker role supervised by launchd.",
     )
+    parser.add_argument("--worker-id", default=None, help="Stable durable identity; defaults to role-host-pid.")
+    parser.add_argument("--once", action="store_true", help="Run one bounded iteration and exit (integration testing).")
+    parser.add_argument("--lease-seconds", type=int, default=60, help="Outbox claim lease duration.")
     args = parser.parse_args()
-    worker_manager.run_background_loop(args.role)
+    worker_manager.run_background_loop(
+        args.role,
+        worker_id=args.worker_id,
+        once=args.once,
+        lease_seconds=args.lease_seconds,
+    )
     return 0
 
 

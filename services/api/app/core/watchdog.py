@@ -131,10 +131,12 @@ class WatchdogService:
 
     def check_readiness(self, require_trading_ready: bool = False) -> dict[str, Any]:
         from app.core.recovery import recovery_manager
+        from app.db.session import SessionLocal
 
         db = self.check_database()
         cache = self.check_redis()
-        recovery = recovery_manager.get_status()
+        with SessionLocal() as session:
+            recovery = recovery_manager.get_status(session)
         resource = self.resource_snapshot()
 
         checks = {

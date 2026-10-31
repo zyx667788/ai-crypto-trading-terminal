@@ -15,9 +15,17 @@
    - 每笔订单生成唯一 `client_order_id`，下单超时进入 `UNKNOWN` 一等状态，必须先向交易所查询与对账，严禁盲目重试。
 4. **数据诚实性**：交易所数据不可用时显示「数据过期/未知」，**绝不用旧值或假数据伪装实时行情**。
 
-## 当前实现状态 (V1.1)
+## 当前实现状态 (V1.2 第一阶段)
 
-- **后端架构**：FastAPI + SQLAlchemy 2.0 + Alembic，24 张核心业务表，全模块已实现 —— Market Data、Scanner、Strategy、AI Orchestrator、Risk Engine、Execution Engine、Portfolio Reconciliation、Journal & Backtest、Background Workers。
+- **跨进程控制面**：Automation Control、Recovery Checkpoint、Worker Heartbeat 全部数据库持久化；Pause、Kill Switch 与 Recovery 闸门由 API 和各 Worker 共同读取。
+- **可靠执行面**：PostgreSQL Transactional Outbox + 租约认领；API/Market Worker 只生产 `execution.order` 任务，Execution Worker 独立消费。`client_order_id` 保证崩溃重放不重复下单。
+- **安全默认**：`AUTO_TRADING_ENABLED=false` 时任何 Worker 都不能创建新订单；`force_live` 绕过路径已删除；Live 继续关闭。
+- **验证**：203 项测试通过，其中 6 项为真实 PostgreSQL + OS 多进程/崩溃恢复；PostgreSQL 全链路迁移与两轮 QUEUED→FILLED 复验通过。
+- **详细清单**：见 [V1.2 第一阶段验收报告](docs/V1.2_PHASE1_ACCEPTANCE.md)。
+
+## V1.1 已实现能力
+
+- **后端架构**：FastAPI + SQLAlchemy 2.0 + Alembic，V1.1 的 24 张核心业务表（V1.2 第一阶段新增 4 张协调表），全模块已实现 —— Market Data、Scanner、Strategy、AI Orchestrator、Risk Engine、Execution Engine、Portfolio Reconciliation、Journal & Backtest、Background Workers。
 - **前端暗色终端**：Next.js 14 App Router + Tailwind CSS，8 大导航板块（Overview 总览、Exchanges 交易所连接、Markets 市场与行情、AI System 智能体控制台、Trading 交易执行、Risk Center 风控中心、Analytics 绩效与回测、Settings 系统与运维）。
 - **自动化测试**：**140 个 pytest 测试全部 Passed**，覆盖精度计算、10 大硬性风控规则、订单状态机与幂等、AI 结构化输出与超时拦截、AI Provider 适配器（JSON 契约/超时/截断/密钥隔离/过期策略）、组合账务不变量、冷启动恢复状态机、备份恢复演练及 REST/WebSocket 冒烟测试。
 - **AI Provider**：支持任意 OpenAI 兼容 `/v1/chat/completions` 端点（`AI_PROVIDER=openai_compatible`），或使用确定性规则模板离线运行（`rule_assisted_mock`，默认，亦为测试模式）。Provider 实测成功时单次 TradePlan 生成约 11-12 秒、约 2400 tokens、成本 ≈ $0.0035。设置页可直接「测试连接」。
@@ -47,7 +55,7 @@
 │       │   ├── api/v1/           # REST 路由 (/api/v1) 与 8 通道 WebSocket (/ws/*)
 │       │   ├── core/             # 配置、密钥加密、结构化日志、精度工具、恢复状态机、Watchdog
 │       │   ├── db/               # 引擎、会话、Decimal 类型、自动迁移引导
-│       │   ├── models/           # 24 张核心数据库模型实体
+│       │   ├── models/           # 28 张数据库模型实体（含 V1.2 协调表）
 │       │   ├── schemas/          # Pydantic 严格数据与 TradePlan 校验模型
 │       │   ├── exchanges/        # ExchangeAdapter 协议及 Binance / OKX 实现
 │       │   ├── market_data/      # 行情标准化与技术指标引擎 (EMA/RSI/MACD/ATR)

@@ -28,13 +28,11 @@ def schema_exists() -> bool:
 
 
 def ensure_schema() -> dict[str, object]:
-    """Apply Alembic migrations when the database has not been initialised yet."""
+    """Apply every pending Alembic migration, including on an existing database."""
     from app.db.session import engine
 
-    if schema_exists():
-        return {"bootstrapped": False, "reason": "schema already present"}
-
-    logger.info("empty database detected; applying Alembic migrations")
+    already_present = schema_exists()
+    logger.info("applying Alembic migrations", extra={"structured_data": {"existing_schema": already_present}})
     from alembic import command
     from alembic.config import Config
 
@@ -45,7 +43,10 @@ def ensure_schema() -> dict[str, object]:
 
     try:
         command.upgrade(cfg, "head")
-        return {"bootstrapped": True, "reason": "alembic upgrade head applied"}
+        return {
+            "bootstrapped": not already_present,
+            "reason": "alembic upgrade head applied" if not already_present else "existing schema upgraded to head",
+        }
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("automatic migration failed", extra={"structured_data": {"error": str(exc)}})
         return {"bootstrapped": False, "reason": f"migration failed: {exc}"}

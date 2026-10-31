@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     LIVE_TRADING_ENABLED: bool = False
     LIVE_MAX_ORDER_NOTIONAL_USDT: Decimal = Decimal("100.00")
     AUTO_TRADING_ENABLED: bool = False
+    RECOVERY_CHECKPOINT_TTL_SECONDS: int = 90
 
     # Conservative Default Risk Limits (Section 3.7)
     DEFAULT_MAX_RISK_PER_TRADE_PCT: Decimal = Decimal("0.0025")   # 0.25% equity

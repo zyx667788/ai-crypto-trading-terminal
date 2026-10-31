@@ -1,3 +1,6 @@
+from app.models.automation import AutomationControl
+from app.models.outbox import OutboxMessage, OutboxStatus
+from app.models.runtime import RecoveryCheckpoint, WorkerHeartbeat
 from app.models.entities import (
     AIDecision,
     AgentRun,
@@ -50,4 +53,9 @@ __all__ = [
     "BacktestRun",
     "KillSwitchState",
     "JournalEntry",
+    "AutomationControl",
+    "OutboxMessage",
+    "OutboxStatus",
+    "RecoveryCheckpoint",
+    "WorkerHeartbeat",
 ]

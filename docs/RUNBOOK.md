@@ -4,7 +4,23 @@
 1. 启动服务：`make dev` 或分别启动后端 `uvicorn app.main:app --host 127.0.0.1 --port 8000` 与前端 `npm run dev`。
 2. 检查健康状态：访问 `http://127.0.0.1:8000/health` 确认 API、Database、Cache/EventBus 与各后台 Worker 状态。
 
-## 2. 常见故障应急预案
+## 2. V1.2 Worker 进程与安全闸门
+
+分别启动三个进程；它们通过 PostgreSQL 共享状态，不依赖 API 进程内存：
+
+```bash
+python -m app.workers.runner --role market-worker
+python -m app.workers.runner --role execution-worker
+python -m app.workers.runner --role recovery-watchdog
+```
+
+- `AUTO_TRADING_ENABLED=false` 时 Market Worker 只刷新行情，Execution Worker 不认领订单任务。
+- API `/automation/pause` 与 Kill Switch 均写入数据库；其他进程在下一次循环及实际提交前重新检查。
+- Execution Worker 崩溃后，Outbox 租约到期会被另一 Worker 回收。同一 `client_order_id` 保证重放不重复创建订单。
+- 可用 `--once --worker-id <id>` 做单次 bounded 验收；`--lease-seconds` 设置认领租约。
+- `GET /api/v1/automation/status` 可查看所有进程最近心跳与恢复检查点。
+
+## 3. 常见故障应急预案
 
 | 故障场景 | 系统自动保护行为 | 人工处置步骤 |
 | --- | --- | --- |

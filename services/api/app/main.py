@@ -74,7 +74,7 @@ async def lifespan(app: FastAPI):
             logger.info("recovery complete", extra={"structured_data": status})
         except Exception as exc:
             logger.exception("recovery failed", extra={"structured_data": {"error": str(exc)}})
-            recovery_manager.force_block(f"Startup recovery failed: {exc}")
+            recovery_manager.force_block(f"Startup recovery failed: {exc}", db=db)
 
     yield
     logger.info("shutting down API")
